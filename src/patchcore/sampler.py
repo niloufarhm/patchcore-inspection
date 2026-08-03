@@ -18,6 +18,7 @@ class BaseSampler(abc.ABC):
         if not 0 < percentage < 1:
             raise ValueError("Percentage value not in (0, 1).")
         self.percentage = percentage
+        self.last_selected_indices = None
 
     @abc.abstractmethod
     def run(
@@ -74,6 +75,11 @@ class GreedyCoresetSampler(BaseSampler):
             features = torch.from_numpy(features)
         reduced_features = self._reduce_features(features)
         sample_indices = self._compute_greedy_coreset_indices(reduced_features)
+        # added for where each memory bank feature came from
+
+        self.last_selected_indices = sample_indices.copy()
+        #
+        
         features = features[sample_indices]
         return self._restore_type(features)
 
