@@ -11,6 +11,10 @@ outputs:
 - blending.csv: percentage of each defect inside/outside the nominal region
 - distances.npz: raw normal and per-defect nearest-neighbour distances
 - distance_distribution.png
+- distance_cdf.png
+- representation_2d_pca.png
+- nearest_neighbor_feature_retrieval.png
+- blending_comparison.png (run-level)
 - fitted reducer/checkpoint when applicable
 
 When two or more methods are selected, comparison.csv is also produced.
@@ -53,7 +57,7 @@ METHODS = (
     "umap",
     "autoencoder",
     "kernel_pca",
-    "sparse_pca",
+    #"sparse_pca",
     "transformer",
 )
 
@@ -64,7 +68,7 @@ ALIASES = {
     "kpca": "kernel_pca",
     "kernelpca": "kernel_pca",
     "spca": "sparse_pca",
-    "sparsepca": "sparse_pca",
+    #"sparsepca": "sparse_pca",
     "transformer_ae": "transformer",
 }
 
@@ -414,6 +418,170 @@ def evaluate(
     )
 
 
+
+def save_cdf_plot(result: MethodResult, directory: Path) -> None:
+    """Save empirical CDF curves for normal and every defect type."""
+    plt.figure(figsize=(10, 6))
+
+    def plot_ecdf(values: np.ndarray, label: str, linewidth: float = 2.0) -> None:
+        ordered = np.sort(np.asarray(values))
+        cumulative = np.arange(1, len(ordered) + 1) / len(ordered)
+        plt.plot(ordered, cumulative, linewidth=linewidth, label=label)
+
+    plot_ecdf(result.normal_distances, "normal", linewidth=2.5)
+    for defect_type, distances in sorted(result.defect_distances.items()):
+        plot_ecdf(distances, defect_type)
+
+    threshold = float(result.metrics["Nominal Threshold"].iloc[0])
+    plt.axvline(
+        threshold,
+        linestyle="--",
+        linewidth=1.5,
+        label=f"nominal threshold ({threshold:.3f})",
+    )
+    plt.xlabel("Distance to nearest nominal patch")
+    plt.ylabel("Cumulative fraction")
+    plt.title(f"{result.name}: cumulative nearest-nominal distances")
+    plt.ylim(0.0, 1.01)
+    plt.grid(alpha=0.2)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(directory / "distance_cdf.png", dpi=180)
+    plt.close()
+
+
+def save_2d_projection(
+    method: str,
+    reference: np.ndarray,
+    normal: np.ndarray,
+    defects: Mapping[str, np.ndarray],
+    directory: Path,
+    seed: int,
+    max_points_per_class: int,
+) -> None:
+    """Create a comparable 2-D PCA view of each method's own representation."""
+    rng = np.random.default_rng(seed)
+
+    def sample(values: np.ndarray) -> np.ndarray:
+        if max_points_per_class <= 0 or len(values) <= max_points_per_class:
+            return values
+        chosen = rng.choice(len(values), max_points_per_class, replace=False)
+        return values[chosen]
+
+    reference_sample = sample(reference)
+    normal_sample = sample(normal)
+    defect_samples = {name: sample(values) for name, values in defects.items()}
+
+    projector = PCA(n_components=2, random_state=seed)
+    projector.fit(reference_sample)
+    normal_2d = projector.transform(normal_sample)
+    defects_2d = {
+        name: projector.transform(values)
+        for name, values in defect_samples.items()
+    }
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(
+        normal_2d[:, 0], normal_2d[:, 1],
+        s=9, alpha=0.18, label="normal",
+    )
+    for defect_type, points in sorted(defects_2d.items()):
+        plt.scatter(
+            points[:, 0], points[:, 1],
+            s=12, alpha=0.42,
+            label=defect_type.replace("_", " "),
+        )
+    explained = float(projector.explained_variance_ratio_.sum())
+    plt.xlabel("Visualization component 1")
+    plt.ylabel("Visualization component 2")
+    plt.title(
+        f"{method}: 2-D visualization of the evaluated representation\n"
+        f"PCA used only for plotting; explained variance={explained:.2%}"
+    )
+    plt.grid(alpha=0.15)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(directory / "representation_2d_pca.png", dpi=180)
+    plt.close()
+
+
+def save_nearest_neighbor_feature_examples(
+    method: str,
+    reference: np.ndarray,
+    defects: Mapping[str, np.ndarray],
+    directory: Path,
+    examples_per_defect: int,
+) -> None:
+    """
+    Save nearest-neighbour retrieval diagnostics in feature space.
+
+    The current pipeline does not retain source image/patch coordinates, so this
+    figure visualizes query and retrieved nominal vectors rather than RGB crops.
+    It still reveals whether the retrieved nominal representation closely follows
+    the defective query. Exact patch-image retrieval requires retaining image IDs
+    and patch-grid coordinates during feature collection.
+    """
+    if examples_per_defect <= 0:
+        return
+
+    nn_model = NearestNeighbors(n_neighbors=1, metric="euclidean", n_jobs=-1)
+    nn_model.fit(reference)
+    rows = []
+
+    for defect_type, values in sorted(defects.items()):
+        distances, indices = nn_model.kneighbors(values, return_distance=True)
+        distances = distances[:, 0]
+        indices = indices[:, 0]
+        if len(values) == 0:
+            continue
+        ranks = np.linspace(0, len(values) - 1, min(examples_per_defect, len(values))).astype(int)
+        ordered = np.argsort(distances)
+        for rank in ranks:
+            query_index = int(ordered[rank])
+            rows.append((defect_type, values[query_index], reference[indices[query_index]], distances[query_index]))
+
+    if not rows:
+        return
+
+    fig, axes = plt.subplots(len(rows), 1, figsize=(12, max(3.0, 2.4 * len(rows))), squeeze=False)
+    for ax, (defect_type, query, neighbour, distance) in zip(axes[:, 0], rows):
+        dimensions = np.arange(min(len(query), 128))
+        ax.plot(dimensions, query[:len(dimensions)], linewidth=1.2, label="defect query")
+        ax.plot(dimensions, neighbour[:len(dimensions)], linewidth=1.2, label="nearest nominal")
+        ax.set_title(f"{defect_type} | nearest distance={distance:.4f}")
+        ax.set_xlabel("Feature dimension (first 128)")
+        ax.set_ylabel("Value")
+        ax.grid(alpha=0.15)
+        ax.legend()
+    fig.suptitle(f"{method}: nearest-neighbour feature retrieval examples", y=1.002)
+    fig.tight_layout()
+    fig.savefig(directory / "nearest_neighbor_feature_retrieval.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_blending_comparison_plot(long_table: pd.DataFrame, run_dir: Path) -> None:
+    """Compare the percentage of defects that blend into the nominal region."""
+    plot_table = long_table.pivot_table(
+        index="Method",
+        columns="Defect Type",
+        values="Inside Nominal Region (%)",
+        aggfunc="first",
+    )
+    if plot_table.empty:
+        return
+
+    ax = plot_table.plot(kind="bar", figsize=(12, 7))
+    ax.set_ylabel("Defective patches inside nominal region (%)")
+    ax.set_xlabel("Method")
+    ax.set_title("Blending comparison across dimensionality-reduction methods")
+    ax.set_ylim(0, 100)
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(title="Defect type")
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(run_dir / "blending_comparison.png", dpi=180)
+    plt.close()
+
 def save_result(result: MethodResult, directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     result.metrics.to_csv(directory / "metrics.csv", index=False)
@@ -436,6 +604,8 @@ def save_result(result: MethodResult, directory: Path) -> None:
     plt.tight_layout()
     plt.savefig(directory / "distance_distribution.png", dpi=180)
     plt.close()
+
+    save_cdf_plot(result, directory)
 
     summary = {
         "method": result.name,
@@ -758,20 +928,20 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
         start = time.perf_counter(); normal_z = transform_batches(transform, normal, args.transform_batch_size); defects_z = {k: transform_batches(transform, v, args.transform_batch_size) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
         joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "kernel_pca.joblib"); extra = {"gamma": float(gamma)}
 
-    elif method == "sparse_pca":
-        # No second sampling: Sparse PCA receives the exact nominal reference
-        # selected once in main(), just like every other method.
-        train_input = sampled_train
-        scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
-        reducer = SparsePCA(
-            n_components=args.latent_dim, alpha=args.spca_alpha,
-            ridge_alpha=args.spca_ridge_alpha, max_iter=args.spca_max_iter,
-            tol=args.spca_tol, method="lars", random_state=args.seed, n_jobs=-1,
-        )
-        start = time.perf_counter(); train_z = reducer.fit_transform(scaled); fit_seconds = time.perf_counter() - start
-        transform = lambda x: reducer.transform(scaler.transform(x))
-        start = time.perf_counter(); normal_z = transform_batches(transform, normal, args.transform_batch_size); defects_z = {k: transform_batches(transform, v, args.transform_batch_size) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
-        joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "sparse_pca.joblib"); extra = {}
+    # elif method == "sparse_pca":
+    #     # No second sampling: Sparse PCA receives the exact nominal reference
+    #     # selected once in main(), just like every other method.
+    #     train_input = sampled_train
+    #     scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
+    #     reducer = SparsePCA(
+    #         n_components=args.latent_dim, alpha=args.spca_alpha,
+    #         ridge_alpha=args.spca_ridge_alpha, max_iter=args.spca_max_iter,
+    #         tol=args.spca_tol, method="lars", random_state=args.seed, n_jobs=-1,
+    #     )
+    #     start = time.perf_counter(); train_z = reducer.fit_transform(scaled); fit_seconds = time.perf_counter() - start
+    #     transform = lambda x: reducer.transform(scaler.transform(x))
+    #     start = time.perf_counter(); normal_z = transform_batches(transform, normal, args.transform_batch_size); defects_z = {k: transform_batches(transform, v, args.transform_batch_size) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
+    #     joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "sparse_pca.joblib"); extra = {}
 
     elif method == "transformer":
         train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_transformer(
@@ -781,11 +951,24 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
     else:
         raise ValueError(method)
 
+    train_z = np.asarray(train_z, dtype=np.float32)
+    normal_z = np.asarray(normal_z, dtype=np.float32)
+    defects_z = {k: np.asarray(v, dtype=np.float32) for k, v in defects_z.items()}
+
+    save_2d_projection(
+        method, train_z, normal_z, defects_z, directory,
+        args.seed, args.visualization_points_per_class,
+    )
+    save_nearest_neighbor_feature_examples(
+        method, train_z, defects_z, directory,
+        args.retrieval_examples_per_defect,
+    )
+
     return evaluate(
         method,
-        np.asarray(train_z, dtype=np.float32),
-        np.asarray(normal_z, dtype=np.float32),
-        {k: np.asarray(v, dtype=np.float32) for k, v in defects_z.items()},
+        train_z,
+        normal_z,
+        defects_z,
         args.nominal_percentile,
         fit_seconds,
         transform_seconds,
@@ -826,6 +1009,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--anomaly-fraction-threshold", type=float, default=0.10)
     p.add_argument("--nominal-percentile", type=float, default=95.0)
     p.add_argument("--transform-batch-size", type=int, default=1000)
+    p.add_argument("--visualization-points-per-class", type=int, default=2000)
+    p.add_argument("--retrieval-examples-per-defect", type=int, default=3)
 
     p.add_argument("--umap-dim", type=int, default=16)
     p.add_argument("--umap-neighbors", type=int, default=30)
@@ -839,10 +1024,10 @@ def parser() -> argparse.ArgumentParser:
 
     p.add_argument("--kpca-gamma", type=float, default=-1.0)
 
-    p.add_argument("--spca-alpha", type=float, default=1.0)
-    p.add_argument("--spca-ridge-alpha", type=float, default=0.01)
-    p.add_argument("--spca-max-iter", type=int, default=300)
-    p.add_argument("--spca-tol", type=float, default=1e-4)
+    # p.add_argument("--spca-alpha", type=float, default=1.0)
+    # p.add_argument("--spca-ridge-alpha", type=float, default=0.01)
+    # p.add_argument("--spca-max-iter", type=int, default=300)
+    # p.add_argument("--spca-tol", type=float, default=1e-4)
 
     p.add_argument("--transformer-epochs", type=int, default=100)
     p.add_argument("--transformer-patience", type=int, default=15)
@@ -927,6 +1112,7 @@ def main() -> None:
 
     long_table, comparison = make_comparison(results)
     long_table.to_csv(run_dir / "all_method_results_long.csv", index=False)
+    save_blending_comparison_plot(long_table, run_dir)
     if len(results) > 1:
         comparison.to_csv(run_dir / "comparison.csv", index=False)
         print("\nCOMPARISON\n")
