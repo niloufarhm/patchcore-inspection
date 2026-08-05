@@ -14,6 +14,9 @@ outputs:
 - fitted reducer/checkpoint when applicable
 
 When two or more methods are selected, comparison.csv is also produced.
+
+The nominal training bank is subsampled exactly ONCE. The same selected patch
+indices are reused by every method, including the Transformer latent bank.
 """
 
 from __future__ import annotations
@@ -308,11 +311,30 @@ def subsample_reference(
         )
         selected = np.asarray(selector.run(features), dtype=np.float32)
         stored = getattr(selector, "last_selected_indices", None)
-        indices = (
-            np.asarray(stored, dtype=np.int64)
-            if stored is not None
-            else np.full(len(selected), -1, dtype=np.int64)
-        )
+        if stored is not None:
+            indices = np.asarray(stored, dtype=np.int64)
+        else:
+            # Upstream PatchCore does not always expose the selected row indices.
+            # Recover them by matching every selected coreset vector to its exact
+            # nearest row in the original nominal feature matrix. This lets every
+            # dimensionality-reduction method reuse the SAME nominal patches.
+            index_finder = NearestNeighbors(
+                n_neighbors=1,
+                metric="euclidean",
+                n_jobs=-1,
+            )
+            index_finder.fit(features)
+            recovery_distances, recovered = index_finder.kneighbors(
+                selected,
+                return_distance=True,
+            )
+            if not np.allclose(recovery_distances[:, 0], 0.0, atol=1e-6):
+                raise RuntimeError(
+                    "Could not recover exact PatchCore coreset indices. "
+                    "Modify ApproximateGreedyCoresetSampler to expose "
+                    "last_selected_indices."
+                )
+            indices = recovered[:, 0].astype(np.int64)
         return selected, indices
 
     raise ValueError(f"Unknown subsampling mode: {mode}")
@@ -601,7 +623,7 @@ def collect_transformer_test(model_pc, model_t, loader, mean, std, device, thres
     return np.concatenate(normal), {k: np.concatenate(v) for k, v in sorted(defects.items())}
 
 
-def run_transformer(sequences, patch_grid, patchcore_model, test_loader, args, directory, device):
+def run_transformer(sequences, patch_grid, patchcore_model, test_loader, selected_indices, args, directory, device):
     if sequences is None:
         raise RuntimeError("Transformer requires intact training sequences.")
     rng = np.random.default_rng(args.seed)
@@ -677,16 +699,20 @@ def run_transformer(sequences, patch_grid, patchcore_model, test_loader, args, d
     )
     transform_seconds = time.perf_counter() - start
 
-    # Sequence training needs complete images. Requested sampling is therefore
-    # applied to the latent nominal reference bank after encoding.
-    train_z, _ = subsample_reference(
-        all_train_z, args.subsampling, args.max_train_patches,
-        args.subsample_percentage, args.seed, device,
-    )
+    # The Transformer must train on intact image sequences, but its nominal
+    # nearest-neighbour reference must use the exact SAME patches selected once
+    # before any method runs. Flattening the sequence latents preserves the same
+    # patch order as collect_training_embeddings().
+    if len(all_train_z) <= int(np.max(selected_indices)):
+        raise RuntimeError(
+            "Selected nominal indices do not match the flattened Transformer "
+            "latent bank."
+        )
+    train_z = all_train_z[selected_indices]
     return train_z, normal_z, defects_z, fit_seconds, transform_seconds, {"best_validation_loss": float(best_loss)}
 
 
-def run_method(method, sampled_train, normal, defects, sequences, patch_grid, patchcore_model, test_loader, args, directory, device):
+def run_method(method, sampled_train, selected_indices, normal, defects, sequences, patch_grid, patchcore_model, test_loader, args, directory, device):
     print(f"\n{'=' * 72}\nMETHOD: {method}\n{'=' * 72}")
 
     if method == "original":
@@ -717,10 +743,9 @@ def run_method(method, sampled_train, normal, defects, sequences, patch_grid, pa
         train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_autoencoder(sampled_train, normal, defects, args, directory, device)
 
     elif method == "kernel_pca":
+        # No second sampling: Kernel PCA receives the exact nominal reference
+        # selected once in main(), just like every other method.
         train_input = sampled_train
-        if args.kpca_train_size > 0 and len(train_input) > args.kpca_train_size:
-            rng = np.random.default_rng(args.seed)
-            train_input = train_input[rng.choice(len(train_input), args.kpca_train_size, replace=False)]
         scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
         gamma = args.kpca_gamma if args.kpca_gamma > 0 else 1.0 / scaled.shape[1]
         reducer = KernelPCA(
@@ -734,10 +759,9 @@ def run_method(method, sampled_train, normal, defects, sequences, patch_grid, pa
         joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "kernel_pca.joblib"); extra = {"gamma": float(gamma)}
 
     elif method == "sparse_pca":
+        # No second sampling: Sparse PCA receives the exact nominal reference
+        # selected once in main(), just like every other method.
         train_input = sampled_train
-        if args.spca_train_size > 0 and len(train_input) > args.spca_train_size:
-            rng = np.random.default_rng(args.seed)
-            train_input = train_input[rng.choice(len(train_input), args.spca_train_size, replace=False)]
         scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
         reducer = SparsePCA(
             n_components=args.latent_dim, alpha=args.spca_alpha,
@@ -751,7 +775,8 @@ def run_method(method, sampled_train, normal, defects, sequences, patch_grid, pa
 
     elif method == "transformer":
         train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_transformer(
-            sequences, patch_grid, patchcore_model, test_loader, args, directory, device
+            sequences, patch_grid, patchcore_model, test_loader,
+            selected_indices, args, directory, device
         )
     else:
         raise ValueError(method)
@@ -812,10 +837,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--ae-encode-batch-size", type=int, default=2048)
     p.add_argument("--ae-lr", type=float, default=1e-3)
 
-    p.add_argument("--kpca-train-size", type=int, default=5000)
     p.add_argument("--kpca-gamma", type=float, default=-1.0)
 
-    p.add_argument("--spca-train-size", type=int, default=10000)
     p.add_argument("--spca-alpha", type=float, default=1.0)
     p.add_argument("--spca-ridge-alpha", type=float, default=0.01)
     p.add_argument("--spca-max-iter", type=int, default=300)
@@ -888,8 +911,8 @@ def main() -> None:
         method_dir = run_dir / method; method_dir.mkdir(parents=True, exist_ok=True)
         try:
             result = run_method(
-                method, sampled_train, normal, defects, sequences, patch_grid,
-                model, test_loader, args, method_dir, device,
+                method, sampled_train, selected_indices, normal, defects,
+                sequences, patch_grid, model, test_loader, args, method_dir, device,
             )
             save_result(result, method_dir)
             results.append(result)
