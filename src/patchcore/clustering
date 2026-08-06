@@ -1,0 +1,1728 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+import time
+import warnings
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    adjusted_mutual_info_score,
+    adjusted_rand_score,
+    calinski_harabasz_score,
+    completeness_score,
+    davies_bouldin_score,
+    homogeneity_score,
+    normalized_mutual_info_score,
+    silhouette_score,
+    v_measure_score,
+)
+from torch.utils.data import DataLoader
+
+
+DEFAULT_CATEGORIES = ("bottle", "capsule", "grid")
+
+MVTEC_CATEGORIES = (
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper",
+)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(value: str) -> torch.device:
+    if value == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(value)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable.")
+    return device
+
+
+def add_repo_src(repo_root: Path) -> None:
+    src = repo_root / "src"
+    if not src.exists():
+        raise FileNotFoundError(f"PatchCore source directory not found: {src}")
+    sys.path.insert(0, str(src))
+
+
+def build_patchcore_model(device: torch.device):
+    import patchcore.backbones as backbones
+    import patchcore.common as common
+    import patchcore.patchcore as patchcore_module
+    import patchcore.sampler as sampler
+
+    backbone = backbones.load("wideresnet50")
+    backbone.name = "wideresnet50"
+
+    model = patchcore_module.PatchCore(device)
+    model.load(
+        backbone=backbone,
+        layers_to_extract_from=["layer2", "layer3"],
+        device=device,
+        input_shape=(3, 224, 224),
+        pretrain_embed_dimension=1024,
+        target_embed_dimension=1024,
+        patchsize=3,
+        patchstride=1,
+        anomaly_score_num_nn=1,
+        featuresampler=sampler.IdentitySampler(),
+        nn_method=common.FaissNN(
+            on_gpu=device.type == "cuda",
+            num_workers=4,
+        ),
+    )
+    model.eval()
+    return model
+
+
+def build_loaders(
+    data_root: Path,
+    category: str,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+):
+    from patchcore.datasets import mvtec
+
+    train_dataset = mvtec.MVTecDataset(
+        source=str(data_root),
+        classname=category,
+        resize=256,
+        train_val_split=1,
+        imagesize=224,
+        split=mvtec.DatasetSplit.TRAIN,
+        seed=seed,
+        augment=False,
+    )
+    test_dataset = mvtec.MVTecDataset(
+        source=str(data_root),
+        classname=category,
+        resize=256,
+        imagesize=224,
+        split=mvtec.DatasetSplit.TEST,
+        seed=seed,
+    )
+
+    loader_args = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "shuffle": False,
+    }
+
+    return (
+        train_dataset,
+        test_dataset,
+        DataLoader(train_dataset, **loader_args),
+        DataLoader(test_dataset, **loader_args),
+    )
+
+
+def extract_patch_embeddings(
+    model,
+    images: torch.Tensor,
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    images = images.to(model.device)
+
+    with torch.no_grad():
+        embeddings, patch_shapes = model._embed(
+            images,
+            detach=True,
+            provide_patch_shapes=True,
+        )
+
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    patch_height, patch_width = patch_shapes[0]
+    embeddings = embeddings.reshape(
+        images.shape[0],
+        patch_height * patch_width,
+        -1,
+    )
+    return embeddings, (patch_height, patch_width)
+
+
+def masks_to_patch_labels(
+    masks: torch.Tensor,
+    patch_grid: Tuple[int, int],
+    anomaly_fraction_threshold: float,
+) -> np.ndarray:
+    if not torch.is_tensor(masks):
+        masks = torch.as_tensor(masks)
+
+    masks = masks.float()
+    if masks.ndim == 3:
+        masks = masks.unsqueeze(1)
+
+    anomaly_fraction = F.adaptive_avg_pool2d(
+        masks,
+        output_size=patch_grid,
+    ).squeeze(1)
+
+    return (
+        anomaly_fraction >= anomaly_fraction_threshold
+    ).cpu().numpy()
+
+
+def safe_text(value) -> str:
+    if torch.is_tensor(value):
+        value = value.item()
+    return str(value)
+
+
+def collect_nominal_training_features(
+    model,
+    train_loader: DataLoader,
+) -> np.ndarray:
+    batches: List[np.ndarray] = []
+
+    for batch_index, batch in enumerate(train_loader):
+        embeddings, _ = extract_patch_embeddings(model, batch["image"])
+        batches.append(
+            embeddings.reshape(-1, embeddings.shape[-1])
+        )
+
+        if (batch_index + 1) % 10 == 0 or batch_index + 1 == len(train_loader):
+            print(
+                f"[training features] "
+                f"{batch_index + 1}/{len(train_loader)}"
+            )
+
+    if not batches:
+        raise RuntimeError("No nominal training features were extracted.")
+
+    return np.concatenate(batches, axis=0).astype(np.float32)
+
+
+def subsample_nominal_reference(
+    features: np.ndarray,
+    mode: str,
+    percentage: float,
+    max_patches: int,
+    seed: int,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    number_of_features = len(features)
+
+    if mode == "none":
+        indices = np.arange(number_of_features, dtype=np.int64)
+        return features, indices
+
+    if mode == "random":
+        target_size = (
+            number_of_features
+            if max_patches <= 0
+            else min(max_patches, number_of_features)
+        )
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(
+            number_of_features,
+            size=target_size,
+            replace=False,
+        ).astype(np.int64)
+        return features[indices], indices
+
+    if mode == "coreset":
+        import patchcore.sampler as sampler
+
+        effective_percentage = percentage
+        if max_patches > 0:
+            effective_percentage = min(
+                effective_percentage,
+                max_patches / number_of_features,
+            )
+
+        effective_percentage = min(
+            max(effective_percentage, 1.0 / number_of_features),
+            1.0,
+        )
+
+        selector = sampler.ApproximateGreedyCoresetSampler(
+            percentage=effective_percentage,
+            device=device,
+        )
+
+        selected = np.asarray(
+            selector.run(features),
+            dtype=np.float32,
+        )
+
+        stored_indices = getattr(
+            selector,
+            "last_selected_indices",
+            None,
+        )
+
+        if stored_indices is not None:
+            indices = np.asarray(
+                stored_indices,
+                dtype=np.int64,
+            )
+        else:
+            # Upstream PatchCore may not expose selected indices. Recover them by
+            # exact row matching. This is used only for reproducibility/output.
+            from sklearn.neighbors import NearestNeighbors
+
+            finder = NearestNeighbors(
+                n_neighbors=1,
+                metric="euclidean",
+                n_jobs=-1,
+            )
+            finder.fit(features)
+            distances, recovered = finder.kneighbors(
+                selected,
+                return_distance=True,
+            )
+
+            if not np.allclose(
+                distances[:, 0],
+                0.0,
+                atol=1e-6,
+            ):
+                raise RuntimeError(
+                    "Could not recover exact coreset row indices. "
+                    "Modify ApproximateGreedyCoresetSampler to save "
+                    "last_selected_indices."
+                )
+
+            indices = recovered[:, 0].astype(np.int64)
+
+        return selected, indices
+
+    raise ValueError(f"Unknown subsampling mode: {mode}")
+
+
+def collect_test_features_and_labels(
+    model,
+    test_loader: DataLoader,
+    anomaly_fraction_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    Returns
+    -------
+    features:
+        Shape [number_of_test_patches, feature_dimension].
+    labels:
+        One string label per patch: "nominal" or a defect type.
+    metadata:
+        image index, patch index, patch row/column, and source anomaly label.
+    """
+    feature_batches: List[np.ndarray] = []
+    label_batches: List[np.ndarray] = []
+    metadata_rows: List[Dict[str, object]] = []
+
+    global_image_index = 0
+
+    for batch_index, batch in enumerate(test_loader):
+        embeddings, patch_grid = extract_patch_embeddings(
+            model,
+            batch["image"],
+        )
+        patch_labels = masks_to_patch_labels(
+            batch["mask"],
+            patch_grid,
+            anomaly_fraction_threshold,
+        )
+
+        patch_height, patch_width = patch_grid
+
+        for image_index in range(embeddings.shape[0]):
+            defect_type = safe_text(
+                batch["anomaly"][image_index]
+            )
+            is_defective_patch = patch_labels[
+                image_index
+            ].reshape(-1)
+
+            image_labels = np.full(
+                len(is_defective_patch),
+                "nominal",
+                dtype=object,
+            )
+
+            if defect_type != "good":
+                image_labels[is_defective_patch] = defect_type
+
+            feature_batches.append(
+                embeddings[image_index]
+            )
+            label_batches.append(image_labels)
+
+            for patch_index, patch_label in enumerate(image_labels):
+                patch_row = patch_index // patch_width
+                patch_column = patch_index % patch_width
+                metadata_rows.append(
+                    {
+                        "global_image_index": global_image_index,
+                        "batch_index": batch_index,
+                        "image_index_in_batch": image_index,
+                        "patch_index": patch_index,
+                        "patch_row": patch_row,
+                        "patch_column": patch_column,
+                        "source_image_anomaly": defect_type,
+                        "true_patch_class": patch_label,
+                    }
+                )
+
+            global_image_index += 1
+
+        if (batch_index + 1) % 10 == 0 or batch_index + 1 == len(test_loader):
+            print(
+                f"[test features] "
+                f"{batch_index + 1}/{len(test_loader)}"
+            )
+
+    features = np.concatenate(
+        feature_batches,
+        axis=0,
+    ).astype(np.float32)
+    labels = np.concatenate(label_batches).astype(str)
+    metadata = pd.DataFrame(metadata_rows)
+
+    return features, labels, metadata
+
+
+def sample_clustering_input(
+    features: np.ndarray,
+    labels: np.ndarray,
+    metadata: pd.DataFrame,
+    max_per_class: int,
+    balanced: bool,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    Select the patch set used by K-Means.
+
+    balanced=True:
+        Use the same number of patches for every class. This prevents nominal
+        patches from dominating the clustering objective.
+
+    balanced=False:
+        Keep up to max_per_class patches independently from each class.
+    """
+    rng = np.random.default_rng(seed)
+    unique_labels = sorted(np.unique(labels).tolist())
+
+    class_indices = {
+        label: np.flatnonzero(labels == label)
+        for label in unique_labels
+    }
+
+    if balanced:
+        smallest_class = min(
+            len(indices)
+            for indices in class_indices.values()
+        )
+        target_per_class = smallest_class
+        if max_per_class > 0:
+            target_per_class = min(
+                target_per_class,
+                max_per_class,
+            )
+    else:
+        target_per_class = max_per_class
+
+    selected_parts: List[np.ndarray] = []
+
+    for label in unique_labels:
+        indices = class_indices[label]
+
+        if balanced:
+            target = target_per_class
+        else:
+            target = (
+                len(indices)
+                if max_per_class <= 0
+                else min(max_per_class, len(indices))
+            )
+
+        if len(indices) > target:
+            selected = rng.choice(
+                indices,
+                size=target,
+                replace=False,
+            )
+        else:
+            selected = indices
+
+        selected_parts.append(
+            np.asarray(selected, dtype=np.int64)
+        )
+
+    selected_indices = np.concatenate(selected_parts)
+    rng.shuffle(selected_indices)
+
+    selected_metadata = metadata.iloc[
+        selected_indices
+    ].copy().reset_index(drop=True)
+    selected_metadata["original_test_patch_row"] = selected_indices
+
+    return (
+        features[selected_indices],
+        labels[selected_indices],
+        selected_metadata,
+    )
+
+
+def clustering_accuracy(
+    true_labels: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> float:
+    """
+    Hungarian-matched clustering accuracy.
+
+    When k differs from the number of true classes, the mapping is necessarily
+    imperfect. The metric is still reported, but ARI/NMI are more appropriate
+    for comparing different k values.
+    """
+    true_values, true_encoded = np.unique(
+        true_labels,
+        return_inverse=True,
+    )
+    cluster_values, cluster_encoded = np.unique(
+        cluster_labels,
+        return_inverse=True,
+    )
+
+    matrix = np.zeros(
+        (len(true_values), len(cluster_values)),
+        dtype=np.int64,
+    )
+
+    for true_id, cluster_id in zip(
+        true_encoded,
+        cluster_encoded,
+    ):
+        matrix[true_id, cluster_id] += 1
+
+    row_ind, col_ind = linear_sum_assignment(
+        matrix.max() - matrix
+    )
+
+    return float(
+        matrix[row_ind, col_ind].sum()
+        / max(len(true_labels), 1)
+    )
+
+
+def cluster_purity(
+    true_labels: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> float:
+    total_correct = 0
+
+    for cluster_id in np.unique(cluster_labels):
+        labels_in_cluster = true_labels[
+            cluster_labels == cluster_id
+        ]
+        _, counts = np.unique(
+            labels_in_cluster,
+            return_counts=True,
+        )
+        total_correct += counts.max()
+
+    return float(
+        total_correct / max(len(true_labels), 1)
+    )
+
+
+def safe_silhouette(
+    features: np.ndarray,
+    cluster_labels: np.ndarray,
+    sample_size: int,
+    seed: int,
+) -> float:
+    if len(np.unique(cluster_labels)) < 2:
+        return float("nan")
+
+    effective_sample_size = min(
+        sample_size,
+        len(features),
+    )
+
+    return float(
+        silhouette_score(
+            features,
+            cluster_labels,
+            metric="euclidean",
+            sample_size=effective_sample_size,
+            random_state=seed,
+        )
+    )
+
+
+def make_contingency_tables(
+    true_labels: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    assignments = pd.DataFrame(
+        {
+            "True Class": true_labels,
+            "Cluster": cluster_labels,
+        }
+    )
+
+    class_to_cluster_counts = pd.crosstab(
+        assignments["True Class"],
+        assignments["Cluster"],
+    )
+
+    class_to_cluster_percent = pd.crosstab(
+        assignments["True Class"],
+        assignments["Cluster"],
+        normalize="index",
+    ) * 100.0
+
+    cluster_composition_counts = pd.crosstab(
+        assignments["Cluster"],
+        assignments["True Class"],
+    )
+
+    cluster_composition_percent = pd.crosstab(
+        assignments["Cluster"],
+        assignments["True Class"],
+        normalize="index",
+    ) * 100.0
+
+    return (
+        class_to_cluster_counts,
+        class_to_cluster_percent,
+        cluster_composition_counts,
+        cluster_composition_percent,
+    )
+
+
+def annotate_heatmap(
+    axis,
+    values: np.ndarray,
+    fmt: str,
+) -> None:
+    for row in range(values.shape[0]):
+        for column in range(values.shape[1]):
+            axis.text(
+                column,
+                row,
+                format(values[row, column], fmt),
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+
+
+def save_heatmap(
+    table: pd.DataFrame,
+    title: str,
+    x_label: str,
+    y_label: str,
+    output_path: Path,
+    percentage: bool,
+) -> None:
+    values = table.to_numpy(dtype=float)
+
+    figure_width = max(
+        8.0,
+        1.25 * len(table.columns) + 3.0,
+    )
+    figure_height = max(
+        5.0,
+        0.65 * len(table.index) + 2.5,
+    )
+
+    plt.figure(
+        figsize=(figure_width, figure_height)
+    )
+    axis = plt.gca()
+    image = axis.imshow(
+        values,
+        aspect="auto",
+    )
+
+    axis.set_xticks(
+        np.arange(len(table.columns))
+    )
+    axis.set_xticklabels(
+        [str(value) for value in table.columns]
+    )
+    axis.set_yticks(
+        np.arange(len(table.index))
+    )
+    axis.set_yticklabels(
+        [str(value) for value in table.index]
+    )
+
+    axis.set_xlabel(x_label)
+    axis.set_ylabel(y_label)
+    axis.set_title(title)
+
+    annotate_heatmap(
+        axis,
+        values,
+        ".1f" if percentage else ".0f",
+    )
+
+    colorbar = plt.colorbar(
+        image,
+        ax=axis,
+    )
+    colorbar.set_label(
+        "Percent" if percentage else "Patch count"
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
+def save_scatter_plot(
+    features_2d: np.ndarray,
+    labels: np.ndarray,
+    title: str,
+    output_path: Path,
+    label_name: str,
+    point_size: float,
+    alpha: float,
+) -> None:
+    plt.figure(figsize=(10, 8))
+
+    unique_labels = sorted(
+        np.unique(labels).tolist(),
+        key=str,
+    )
+
+    for label in unique_labels:
+        mask = labels == label
+        plt.scatter(
+            features_2d[mask, 0],
+            features_2d[mask, 1],
+            s=point_size,
+            alpha=alpha,
+            label=str(label),
+        )
+
+    plt.xlabel("Visualization PCA component 1")
+    plt.ylabel("Visualization PCA component 2")
+    plt.title(title)
+    plt.legend(
+        title=label_name,
+        frameon=True,
+        markerscale=2,
+    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
+def save_combined_scatter(
+    features_2d: np.ndarray,
+    true_labels: np.ndarray,
+    cluster_labels: np.ndarray,
+    title: str,
+    output_path: Path,
+    point_size: float,
+    alpha: float,
+) -> None:
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(18, 7),
+    )
+
+    for label in sorted(
+        np.unique(true_labels).tolist(),
+        key=str,
+    ):
+        mask = true_labels == label
+        axes[0].scatter(
+            features_2d[mask, 0],
+            features_2d[mask, 1],
+            s=point_size,
+            alpha=alpha,
+            label=str(label),
+        )
+
+    axes[0].set_title("Ground-truth patch classes")
+    axes[0].set_xlabel("Visualization PCA component 1")
+    axes[0].set_ylabel("Visualization PCA component 2")
+    axes[0].legend(
+        title="True class",
+        markerscale=2,
+    )
+
+    for cluster_id in sorted(
+        np.unique(cluster_labels).tolist()
+    ):
+        mask = cluster_labels == cluster_id
+        axes[1].scatter(
+            features_2d[mask, 0],
+            features_2d[mask, 1],
+            s=point_size,
+            alpha=alpha,
+            label=f"Cluster {cluster_id}",
+        )
+
+    axes[1].set_title("Unsupervised K-Means clusters")
+    axes[1].set_xlabel("Visualization PCA component 1")
+    axes[1].set_ylabel("Visualization PCA component 2")
+    axes[1].legend(
+        title="Cluster",
+        markerscale=2,
+    )
+
+    figure.suptitle(title)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
+def fit_cluster_model(
+    features: np.ndarray,
+    number_of_clusters: int,
+    algorithm: str,
+    seed: int,
+    max_iter: int,
+    n_init: int,
+    minibatch_size: int,
+):
+    if algorithm == "kmeans":
+        model = KMeans(
+            n_clusters=number_of_clusters,
+            random_state=seed,
+            n_init=n_init,
+            max_iter=max_iter,
+        )
+    elif algorithm == "minibatch_kmeans":
+        model = MiniBatchKMeans(
+            n_clusters=number_of_clusters,
+            random_state=seed,
+            n_init=n_init,
+            max_iter=max_iter,
+            batch_size=minibatch_size,
+            reassignment_ratio=0.01,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported clustering algorithm: {algorithm}"
+        )
+
+    cluster_labels = model.fit_predict(features)
+    return model, cluster_labels
+
+
+def run_category(
+    category: str,
+    model,
+    data_root: Path,
+    output_dir: Path,
+    args,
+    device: torch.device,
+) -> pd.DataFrame:
+    print(
+        f"\n{'=' * 88}\n"
+        f"CATEGORY: {category}\n"
+        f"{'=' * 88}"
+    )
+
+    category_dir = output_dir / category
+    category_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    (
+        train_dataset,
+        test_dataset,
+        train_loader,
+        test_loader,
+    ) = build_loaders(
+        data_root=data_root,
+        category=category,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
+
+    print(
+        f"Training images: {len(train_dataset)}"
+    )
+    print(
+        f"Testing images: {len(test_dataset)}"
+    )
+
+    all_nominal_train = collect_nominal_training_features(
+        model,
+        train_loader,
+    )
+
+    selected_nominal_train, selected_indices = (
+        subsample_nominal_reference(
+            features=all_nominal_train,
+            mode=args.subsampling,
+            percentage=args.subsample_percentage,
+            max_patches=args.max_train_patches,
+            seed=args.seed,
+            device=device,
+        )
+    )
+
+    np.save(
+        category_dir / "selected_reference_indices.npy",
+        selected_indices,
+    )
+
+    print(
+        f"All nominal training patches: "
+        f"{all_nominal_train.shape}"
+    )
+    print(
+        f"Selected nominal PCA reference: "
+        f"{selected_nominal_train.shape}"
+    )
+
+    pca_components = min(
+        args.pca_dim,
+        selected_nominal_train.shape[0],
+        selected_nominal_train.shape[1],
+    )
+
+    if pca_components < 2:
+        raise RuntimeError(
+            "PCA needs at least two components."
+        )
+
+    pca_model = PCA(
+        n_components=pca_components,
+        random_state=args.seed,
+    )
+
+    pca_start = time.perf_counter()
+    pca_model.fit(selected_nominal_train)
+    pca_fit_seconds = (
+        time.perf_counter() - pca_start
+    )
+
+    joblib.dump(
+        pca_model,
+        category_dir / "pca_model.joblib",
+    )
+
+    pca_summary = {
+        "category": category,
+        "input_dimension": int(
+            selected_nominal_train.shape[1]
+        ),
+        "pca_dimension": int(pca_components),
+        "explained_variance_ratio_sum": float(
+            pca_model.explained_variance_ratio_.sum()
+        ),
+        "pca_fit_seconds": float(pca_fit_seconds),
+        "subsampling": args.subsampling,
+        "selected_nominal_patch_count": int(
+            len(selected_nominal_train)
+        ),
+    }
+
+    (
+        category_dir / "pca_summary.json"
+    ).write_text(
+        json.dumps(pca_summary, indent=2)
+    )
+
+    test_features, test_labels, test_metadata = (
+        collect_test_features_and_labels(
+            model=model,
+            test_loader=test_loader,
+            anomaly_fraction_threshold=(
+                args.anomaly_fraction_threshold
+            ),
+        )
+    )
+
+    (
+        clustering_original_features,
+        clustering_true_labels,
+        clustering_metadata,
+    ) = sample_clustering_input(
+        features=test_features,
+        labels=test_labels,
+        metadata=test_metadata,
+        max_per_class=args.max_patches_per_class,
+        balanced=args.balanced_classes,
+        seed=args.seed,
+    )
+
+    clustering_pca_features = pca_model.transform(
+        clustering_original_features
+    ).astype(np.float32)
+
+    class_counts = pd.Series(
+        clustering_true_labels
+    ).value_counts().sort_index()
+
+    print("Clustering patch counts by class:")
+    print(class_counts.to_string())
+
+    input_table = clustering_metadata.copy()
+    input_table["true_class"] = (
+        clustering_true_labels
+    )
+
+    for component_index in range(
+        clustering_pca_features.shape[1]
+    ):
+        input_table[
+            f"pca_{component_index + 1}"
+        ] = clustering_pca_features[
+            :,
+            component_index,
+        ]
+
+    input_table.to_csv(
+        category_dir / "clustering_input.csv",
+        index=False,
+    )
+
+    # A separate two-dimensional PCA is fitted only for visualization.
+    visualization_pca = PCA(
+        n_components=2,
+        random_state=args.seed,
+    )
+    visualization_features = (
+        visualization_pca.fit_transform(
+            clustering_pca_features
+        )
+    )
+
+    joblib.dump(
+        visualization_pca,
+        category_dir / "pca_2d_visualizer.joblib",
+    )
+
+    save_scatter_plot(
+        features_2d=visualization_features,
+        labels=clustering_true_labels,
+        title=(
+            f"{category}: true patch classes "
+            f"after {pca_components}-D nominal-trained PCA"
+        ),
+        output_path=(
+            category_dir
+            / "all_true_classes_scatter.png"
+        ),
+        label_name="True class",
+        point_size=args.scatter_point_size,
+        alpha=args.scatter_alpha,
+    )
+
+    summary_rows: List[Dict[str, object]] = []
+
+    true_class_count = len(
+        np.unique(clustering_true_labels)
+    )
+
+    for number_of_clusters in range(
+        args.min_clusters,
+        args.max_clusters + 1,
+    ):
+        print(
+            f"\n[{category}] Clustering with "
+            f"k={number_of_clusters}"
+        )
+
+        k_dir = category_dir / f"k_{number_of_clusters}"
+        k_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        fit_start = time.perf_counter()
+        cluster_model, cluster_labels = (
+            fit_cluster_model(
+                features=clustering_pca_features,
+                number_of_clusters=(
+                    number_of_clusters
+                ),
+                algorithm=args.cluster_algorithm,
+                seed=args.seed,
+                max_iter=args.cluster_max_iter,
+                n_init=args.cluster_n_init,
+                minibatch_size=(
+                    args.minibatch_size
+                ),
+            )
+        )
+        fit_seconds = (
+            time.perf_counter() - fit_start
+        )
+
+        joblib.dump(
+            cluster_model,
+            k_dir / "cluster_model.joblib",
+        )
+
+        (
+            class_to_cluster_counts,
+            class_to_cluster_percent,
+            cluster_composition_counts,
+            cluster_composition_percent,
+        ) = make_contingency_tables(
+            clustering_true_labels,
+            cluster_labels,
+        )
+
+        class_to_cluster_counts.to_csv(
+            k_dir / "class_to_cluster_counts.csv"
+        )
+        class_to_cluster_percent.to_csv(
+            k_dir / "class_to_cluster_percent.csv"
+        )
+        cluster_composition_counts.to_csv(
+            k_dir / "cluster_composition_counts.csv"
+        )
+        cluster_composition_percent.to_csv(
+            k_dir / "cluster_composition_percent.csv"
+        )
+
+        assignments = clustering_metadata.copy()
+        assignments["true_class"] = (
+            clustering_true_labels
+        )
+        assignments["cluster"] = cluster_labels
+        assignments.to_csv(
+            k_dir / "assignments.csv",
+            index=False,
+        )
+
+        metrics = {
+            "category": category,
+            "number_of_clusters": int(
+                number_of_clusters
+            ),
+            "number_of_true_classes": int(
+                true_class_count
+            ),
+            "patch_count": int(
+                len(clustering_pca_features)
+            ),
+            "pca_dimension": int(
+                clustering_pca_features.shape[1]
+            ),
+            "algorithm": args.cluster_algorithm,
+            "fit_seconds": float(fit_seconds),
+            "inertia": float(
+                cluster_model.inertia_
+            ),
+            "adjusted_rand_index": float(
+                adjusted_rand_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "adjusted_mutual_information": float(
+                adjusted_mutual_info_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "normalized_mutual_information": float(
+                normalized_mutual_info_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "homogeneity": float(
+                homogeneity_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "completeness": float(
+                completeness_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "v_measure": float(
+                v_measure_score(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "hungarian_accuracy": float(
+                clustering_accuracy(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "purity": float(
+                cluster_purity(
+                    clustering_true_labels,
+                    cluster_labels,
+                )
+            ),
+            "silhouette": float(
+                safe_silhouette(
+                    clustering_pca_features,
+                    cluster_labels,
+                    sample_size=(
+                        args.silhouette_sample_size
+                    ),
+                    seed=args.seed,
+                )
+            ),
+            "calinski_harabasz": float(
+                calinski_harabasz_score(
+                    clustering_pca_features,
+                    cluster_labels,
+                )
+            ),
+            "davies_bouldin": float(
+                davies_bouldin_score(
+                    clustering_pca_features,
+                    cluster_labels,
+                )
+            ),
+        }
+
+        (
+            k_dir / "metrics.json"
+        ).write_text(
+            json.dumps(metrics, indent=2)
+        )
+
+        summary_rows.append(metrics)
+
+        save_heatmap(
+            table=class_to_cluster_percent,
+            title=(
+                f"{category}, k={number_of_clusters}: "
+                f"where each true class is assigned"
+            ),
+            x_label="Cluster",
+            y_label="True patch class",
+            output_path=(
+                k_dir
+                / "class_to_cluster_heatmap.png"
+            ),
+            percentage=True,
+        )
+
+        save_heatmap(
+            table=cluster_composition_percent,
+            title=(
+                f"{category}, k={number_of_clusters}: "
+                f"composition of every cluster"
+            ),
+            x_label="True patch class",
+            y_label="Cluster",
+            output_path=(
+                k_dir
+                / "cluster_composition_heatmap.png"
+            ),
+            percentage=True,
+        )
+
+        save_scatter_plot(
+            features_2d=visualization_features,
+            labels=cluster_labels.astype(str),
+            title=(
+                f"{category}: K-Means clusters "
+                f"(k={number_of_clusters})"
+            ),
+            output_path=(
+                k_dir / "scatter_clusters.png"
+            ),
+            label_name="Cluster",
+            point_size=args.scatter_point_size,
+            alpha=args.scatter_alpha,
+        )
+
+        save_scatter_plot(
+            features_2d=visualization_features,
+            labels=clustering_true_labels,
+            title=(
+                f"{category}: ground-truth classes "
+                f"for k={number_of_clusters} comparison"
+            ),
+            output_path=(
+                k_dir
+                / "scatter_true_classes.png"
+            ),
+            label_name="True class",
+            point_size=args.scatter_point_size,
+            alpha=args.scatter_alpha,
+        )
+
+        save_combined_scatter(
+            features_2d=visualization_features,
+            true_labels=clustering_true_labels,
+            cluster_labels=cluster_labels,
+            title=(
+                f"{category}: true classes versus "
+                f"K-Means clusters, k={number_of_clusters}"
+            ),
+            output_path=(
+                k_dir
+                / "scatter_true_vs_clusters.png"
+            ),
+            point_size=args.scatter_point_size,
+            alpha=args.scatter_alpha,
+        )
+
+        print(
+            pd.Series(metrics).to_string()
+        )
+
+    category_summary = pd.DataFrame(
+        summary_rows
+    ).sort_values(
+        "number_of_clusters"
+    )
+
+    category_summary.to_csv(
+        category_dir / "cluster_summary.csv",
+        index=False,
+    )
+
+    category_run_config = {
+        "category": category,
+        "subsampling": args.subsampling,
+        "subsample_percentage": (
+            args.subsample_percentage
+        ),
+        "max_train_patches": (
+            args.max_train_patches
+        ),
+        "pca_dimension": pca_components,
+        "balanced_classes": (
+            args.balanced_classes
+        ),
+        "max_patches_per_class": (
+            args.max_patches_per_class
+        ),
+        "min_clusters": args.min_clusters,
+        "max_clusters": args.max_clusters,
+        "cluster_algorithm": (
+            args.cluster_algorithm
+        ),
+        "seed": args.seed,
+        "true_classes": sorted(
+            np.unique(
+                clustering_true_labels
+            ).tolist()
+        ),
+        "class_counts": {
+            str(key): int(value)
+            for key, value in class_counts.items()
+        },
+    }
+
+    (
+        category_dir / "run_config.json"
+    ).write_text(
+        json.dumps(
+            category_run_config,
+            indent=2,
+        )
+    )
+
+    return category_summary
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fit nominal-trained PCA and evaluate K-Means "
+            "cluster structure for MVTec test patches."
+        )
+    )
+
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(
+            "pca_clustering_results"
+        ),
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=list(DEFAULT_CATEGORIES),
+        choices=MVTEC_CATEGORIES,
+        help=(
+            "One or more MVTec categories. "
+            "Default: bottle capsule grid."
+        ),
+    )
+
+    parser.add_argument(
+        "--subsampling",
+        choices=("coreset", "random", "none"),
+        default="coreset",
+        help=(
+            "Nominal training reference selection used "
+            "before fitting PCA."
+        ),
+    )
+    parser.add_argument(
+        "--subsample-percentage",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--max-train-patches",
+        type=int,
+        default=30000,
+    )
+    parser.add_argument(
+        "--pca-dim",
+        type=int,
+        default=64,
+    )
+
+    parser.add_argument(
+        "--min-clusters",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--max-clusters",
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        "--cluster-algorithm",
+        choices=("kmeans", "minibatch_kmeans"),
+        default="kmeans",
+    )
+    parser.add_argument(
+        "--cluster-max-iter",
+        type=int,
+        default=300,
+    )
+    parser.add_argument(
+        "--cluster-n-init",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--minibatch-size",
+        type=int,
+        default=2048,
+    )
+
+    parser.add_argument(
+        "--balanced-classes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use equal patch counts for nominal and every "
+            "defect type before clustering. Default: true."
+        ),
+    )
+    parser.add_argument(
+        "--max-patches-per-class",
+        type=int,
+        default=2000,
+        help=(
+            "Maximum clustering patches retained per true "
+            "class. With balanced classes, every class uses "
+            "the same count up to this maximum."
+        ),
+    )
+
+    parser.add_argument(
+        "--anomaly-fraction-threshold",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--silhouette-sample-size",
+        type=int,
+        default=5000,
+    )
+    parser.add_argument(
+        "--scatter-point-size",
+        type=float,
+        default=10.0,
+    )
+    parser.add_argument(
+        "--scatter-alpha",
+        type=float,
+        default=0.35,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+    )
+
+    return parser
+
+
+def validate_arguments(args) -> None:
+    if not 0 < args.subsample_percentage <= 1:
+        raise ValueError(
+            "--subsample-percentage must be in (0, 1]."
+        )
+
+    if args.pca_dim < 2:
+        raise ValueError(
+            "--pca-dim must be at least 2."
+        )
+
+    if args.min_clusters < 2:
+        raise ValueError(
+            "--min-clusters must be at least 2."
+        )
+
+    if args.max_clusters < args.min_clusters:
+        raise ValueError(
+            "--max-clusters must be >= --min-clusters."
+        )
+
+    if args.max_patches_per_class == 0:
+        raise ValueError(
+            "--max-patches-per-class must be positive "
+            "or negative for no cap."
+        )
+
+    if not 0 < args.anomaly_fraction_threshold <= 1:
+        raise ValueError(
+            "--anomaly-fraction-threshold must be in (0, 1]."
+        )
+
+
+def main() -> None:
+    parser = create_parser()
+    args = parser.parse_args()
+    validate_arguments(args)
+
+    set_seed(args.seed)
+    device = resolve_device(args.device)
+
+    repo_root = args.repo_root.resolve()
+    data_root = args.data_root.resolve()
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    add_repo_src(repo_root)
+
+    global_config = vars(args).copy()
+    global_config.update(
+        {
+            "repo_root": str(repo_root),
+            "data_root": str(data_root),
+            "output_dir": str(output_dir),
+            "device": str(device),
+        }
+    )
+
+    (
+        output_dir / "run_config.json"
+    ).write_text(
+        json.dumps(
+            global_config,
+            indent=2,
+            default=str,
+        )
+    )
+
+    print(
+        json.dumps(
+            global_config,
+            indent=2,
+            default=str,
+        )
+    )
+
+    patchcore_model = build_patchcore_model(
+        device
+    )
+
+    all_category_summaries: List[pd.DataFrame] = []
+
+    for category in args.categories:
+        try:
+            category_summary = run_category(
+                category=category,
+                model=patchcore_model,
+                data_root=data_root,
+                output_dir=output_dir,
+                args=args,
+                device=device,
+            )
+            all_category_summaries.append(
+                category_summary
+            )
+        except Exception as error:
+            category_dir = output_dir / category
+            category_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            error_record = {
+                "category": category,
+                "error_type": type(error).__name__,
+                "message": str(error),
+            }
+            (
+                category_dir / "error.json"
+            ).write_text(
+                json.dumps(
+                    error_record,
+                    indent=2,
+                )
+            )
+            print(
+                f"[ERROR] {category}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    if not all_category_summaries:
+        raise RuntimeError(
+            "Every category failed. Check category error.json files."
+        )
+
+    combined_summary = pd.concat(
+        all_category_summaries,
+        ignore_index=True,
+    )
+
+    combined_summary.to_csv(
+        output_dir
+        / "all_categories_cluster_summary.csv",
+        index=False,
+    )
+
+    best_by_silhouette = (
+        combined_summary
+        .sort_values(
+            ["category", "silhouette"],
+            ascending=[True, False],
+        )
+        .groupby(
+            "category",
+            as_index=False,
+        )
+        .first()
+    )
+
+    best_by_ari = (
+        combined_summary
+        .sort_values(
+            [
+                "category",
+                "adjusted_rand_index",
+            ],
+            ascending=[True, False],
+        )
+        .groupby(
+            "category",
+            as_index=False,
+        )
+        .first()
+    )
+
+    best_by_silhouette.to_csv(
+        output_dir / "best_k_by_silhouette.csv",
+        index=False,
+    )
+    best_by_ari.to_csv(
+        output_dir / "best_k_by_ari.csv",
+        index=False,
+    )
+
+    print("\nBEST K BY SILHOUETTE")
+    print(
+        best_by_silhouette[
+            [
+                "category",
+                "number_of_clusters",
+                "silhouette",
+                "adjusted_rand_index",
+                "normalized_mutual_information",
+            ]
+        ].round(4).to_string(index=False)
+    )
+
+    print("\nBEST K BY ARI")
+    print(
+        best_by_ari[
+            [
+                "category",
+                "number_of_clusters",
+                "adjusted_rand_index",
+                "normalized_mutual_information",
+                "silhouette",
+            ]
+        ].round(4).to_string(index=False)
+    )
+
+    print(
+        f"\nFinished. Outputs: {output_dir}"
+    )
+
+
+if __name__ == "__main__":
+    main()
