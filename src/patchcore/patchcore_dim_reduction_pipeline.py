@@ -346,10 +346,21 @@ def subsample_reference(
         # reuse those saved indices instead of recomputing it.
         if preselected_indices is not None:
             cached = np.asarray(preselected_indices, dtype=np.int64)
-            if len(cached) == target_size:
+            if len(cached) > 0:
                 if cached.min() < 0 or cached.max() >= n:
                     raise ValueError("Cached coreset indices are out of bounds.")
-                return features[cached], cached
+                # PatchCore samplers may round floor/ceil differently by one or a
+                # few samples.  If the saved cache is effectively the requested
+                # percentage, reuse it instead of running greedy coreset again.
+                cached_fraction = len(cached) / float(n)
+                tolerance = max(2.0 / float(n), 1e-3)
+                max_ok = max_patches <= 0 or len(cached) <= max_patches
+                if max_ok and abs(cached_fraction - percentage) <= tolerance:
+                    print(
+                        f"[subsampling] reusing cached coreset indices: "
+                        f"{len(cached)}/{n} ({cached_fraction:.4%})"
+                    )
+                    return np.asarray(features[cached], dtype=np.float32), cached
 
         import patchcore.sampler as sampler
 
@@ -358,7 +369,7 @@ def subsample_reference(
             percentage=effective,
             device=device,
         )
-        selected = np.asarray(selector.run(features), dtype=np.float32)
+        selected = np.asarray(selector.run(np.array(features, dtype=np.float32, copy=True)), dtype=np.float32)
         stored = getattr(selector, "last_selected_indices", None)
         if stored is not None:
             indices = np.asarray(stored, dtype=np.int64)
@@ -498,6 +509,43 @@ def transform_batches(function, values: np.ndarray, batch_size: int) -> np.ndarr
     )
 
 
+def nearest_nominal_distances(
+    reference: np.ndarray,
+    query: np.ndarray,
+    batch_size: int = 4096,
+    backend: str = "auto",
+) -> np.ndarray:
+    """Exact 1-NN Euclidean distances, using FAISS when available."""
+    reference = np.ascontiguousarray(reference, dtype=np.float32)
+    query = np.ascontiguousarray(query, dtype=np.float32)
+
+    use_faiss = backend in ("auto", "faiss")
+    if use_faiss:
+        try:
+            import faiss
+        except Exception:
+            if backend == "faiss":
+                raise
+        else:
+            index = faiss.IndexFlatL2(reference.shape[1])
+            index.add(reference)
+            parts = []
+            for start in range(0, len(query), batch_size):
+                d2, _ = index.search(query[start:start + batch_size], 1)
+                parts.append(np.sqrt(np.maximum(d2[:, 0], 0.0)))
+            return np.concatenate(parts).astype(np.float32, copy=False)
+
+    nn_model = NearestNeighbors(n_neighbors=1, metric="euclidean", n_jobs=-1)
+    nn_model.fit(reference)
+    parts = []
+    for start in range(0, len(query), batch_size):
+        part = nn_model.kneighbors(
+            query[start:start + batch_size], return_distance=True
+        )[0][:, 0]
+        parts.append(part)
+    return np.concatenate(parts).astype(np.float32, copy=False)
+
+
 def evaluate(
     method: str,
     reference: np.ndarray,
@@ -507,17 +555,21 @@ def evaluate(
     fit_seconds: float,
     transform_seconds: float,
     extra: Optional[Dict[str, float]] = None,
+    nn_query_batch_size: int = 4096,
+    nn_backend: str = "auto",
 ) -> MethodResult:
-    nn_model = NearestNeighbors(n_neighbors=1, metric="euclidean", n_jobs=-1)
-    nn_model.fit(reference)
-    normal_distances = nn_model.kneighbors(normal, return_distance=True)[0][:, 0]
+    normal_distances = nearest_nominal_distances(
+        reference, normal, batch_size=nn_query_batch_size, backend=nn_backend
+    )
     normal_mean = float(normal_distances.mean())
     threshold = float(np.percentile(normal_distances, nominal_percentile))
 
     rows, blend_rows = [], []
     distance_map: Dict[str, np.ndarray] = {}
     for defect_type, values in sorted(defects.items()):
-        distances = nn_model.kneighbors(values, return_distance=True)[0][:, 0]
+        distances = nearest_nominal_distances(
+            reference, values, batch_size=nn_query_batch_size, backend=nn_backend
+        )
         distance_map[defect_type] = distances
         labels = np.concatenate([np.zeros(len(normal_distances)), np.ones(len(distances))])
         scores = np.concatenate([normal_distances, distances])
@@ -563,7 +615,6 @@ def evaluate(
         output_dim=reference.shape[1],
         extra=extra or {},
     )
-
 
 
 def save_cdf_plot(result: MethodResult, directory: Path) -> None:
@@ -1277,21 +1328,212 @@ def save_projection_stage(
             )
 
 
-def run_method(method, sampled_train, selected_indices, normal, defects, sequences, patch_grid, patchcore_model, test_loader, args, directory, device, cached_test=None):
+def checkpoint_filename(method: str) -> Optional[str]:
+    return {
+        "pca": "pca.joblib",
+        "umap": "umap.joblib",
+        "autoencoder": "autoencoder.pt",
+        "kernel_pca": "kernel_pca.joblib",
+        "transformer": "transformer_autoencoder.pt",
+    }.get(method)
+
+
+def resolve_existing_checkpoint(
+    method: str,
+    args,
+    category: str,
+    subsampling: str,
+    current_method_dir: Path,
+) -> Optional[Path]:
+    if args.force_refit:
+        return None
+    filename = checkpoint_filename(method)
+    if filename is None:
+        return None
+
+    candidates = []
+    if args.checkpoint_root is not None:
+        candidates.append(
+            args.checkpoint_root.resolve() / category / subsampling / method / filename
+        )
+    candidates.append(current_method_dir / filename)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_autoencoder_representation(checkpoint: Path, train, normal, defects, args, device):
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    input_dim = int(ckpt.get("input_dim", train.shape[1]))
+    latent_dim = int(ckpt.get("latent_dim", args.latent_dim))
+    if input_dim != train.shape[1]:
+        raise ValueError(
+            f"Autoencoder checkpoint expects {input_dim}D input, got {train.shape[1]}D."
+        )
+    model = EmbeddingAutoencoder(input_dim, latent_dim).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    mean = np.asarray(ckpt["mean"], dtype=np.float32)
+    std = np.asarray(ckpt["std"], dtype=np.float32)
+    start = time.perf_counter()
+    train_z = encode_ae(model, train, mean, std, device, args.ae_encode_batch_size)
+    normal_z = encode_ae(model, normal, mean, std, device, args.ae_encode_batch_size)
+    defects_z = {
+        k: encode_ae(model, v, mean, std, device, args.ae_encode_batch_size)
+        for k, v in defects.items()
+    }
+    elapsed = time.perf_counter() - start
+    return train_z, normal_z, defects_z, 0.0, elapsed, {
+        "checkpoint_reused": 1.0,
+        "checkpoint_latent_dim": float(latent_dim),
+    }
+
+
+def load_transformer_representation(
+    checkpoint: Path, sequences, selected_indices, cached_test, args, device
+):
+    if sequences is None:
+        raise RuntimeError("Transformer checkpoint reuse requires intact nominal sequences.")
+    if cached_test is None:
+        raise RuntimeError(
+            "Transformer checkpoint reuse from --source data is not implemented; "
+            "use --source features or --force-refit."
+        )
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    patch_grid = tuple(ckpt.get("patch_grid", (int(np.sqrt(sequences.shape[1])),) * 2))
+    input_dim = int(ckpt.get("input_dim", sequences.shape[-1]))
+    latent_dim = int(ckpt.get("latent_dim", args.latent_dim))
+
+    # Infer architecture from state dict where possible, falling back to CLI values.
+    state = ckpt["state_dict"]
+    model_dim = int(state["input_projection.weight"].shape[0])
+    heads = args.transformer_heads
+    enc_layers = len({k.split('.')[2] for k in state if k.startswith('encoder.layers.')}) or args.transformer_encoder_layers
+    dec_layers = len({k.split('.')[2] for k in state if k.startswith('decoder.layers.')}) or args.transformer_decoder_layers
+    model = SpatialTransformerAutoencoder(
+        input_dim=input_dim,
+        patches=int(patch_grid[0] * patch_grid[1]),
+        latent_dim=latent_dim,
+        model_dim=model_dim,
+        heads=heads,
+        encoder_layers=enc_layers,
+        decoder_layers=dec_layers,
+        dropout=args.transformer_dropout,
+    ).to(device)
+    model.load_state_dict(state)
+    mean = np.asarray(ckpt["mean"], dtype=np.float32)
+    std = np.asarray(ckpt["std"], dtype=np.float32)
+
+    start = time.perf_counter()
+    all_train_z = encode_transformer_sequences(
+        model, sequences, mean, std, device, args.transformer_batch_size
+    )
+    train_z = all_train_z[selected_indices]
+    normal_z, defects_z = collect_transformer_test_cached(
+        model, cached_test, mean, std, device, args.transformer_batch_size
+    )
+    elapsed = time.perf_counter() - start
+    return train_z, normal_z, defects_z, 0.0, elapsed, {
+        "checkpoint_reused": 1.0,
+        "checkpoint_latent_dim": float(latent_dim),
+    }
+
+
+def run_method(
+    method, sampled_train, selected_indices, normal, defects, sequences,
+    patch_grid, patchcore_model, test_loader, args, directory, device,
+    cached_test=None, category=None, subsampling=None,
+):
     print(f"\n{'=' * 72}\nMETHOD: {method}\n{'=' * 72}")
+
+    checkpoint = resolve_existing_checkpoint(
+        method, args, category, subsampling, directory
+    ) if category is not None and subsampling is not None else None
 
     if method == "original":
         train_z, normal_z, defects_z = sampled_train, normal, dict(defects)
-        fit_seconds = transform_seconds = 0.0; extra = {}
+        fit_seconds = transform_seconds = 0.0
+        extra = {"checkpoint_reused": 0.0}
+
+    elif checkpoint is not None and method == "pca":
+        print(f"[checkpoint] loading PCA: {checkpoint}")
+        reducer = joblib.load(checkpoint)
+        start = time.perf_counter()
+        train_z = reducer.transform(sampled_train)
+        normal_z = reducer.transform(normal)
+        defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+        transform_seconds = time.perf_counter() - start
+        fit_seconds = 0.0
+        extra = {
+            "checkpoint_reused": 1.0,
+            "explained_variance": float(reducer.explained_variance_ratio_.sum()),
+        }
+
+    elif checkpoint is not None and method == "umap":
+        print(f"[checkpoint] loading UMAP: {checkpoint}")
+        reducer = joblib.load(checkpoint)
+        start = time.perf_counter()
+        train_z = reducer.transform(sampled_train)
+        normal_z = reducer.transform(normal)
+        defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+        transform_seconds = time.perf_counter() - start
+        fit_seconds = 0.0
+        extra = {"checkpoint_reused": 1.0}
+
+    elif checkpoint is not None and method == "autoencoder":
+        print(f"[checkpoint] loading Autoencoder: {checkpoint}")
+        train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = (
+            load_autoencoder_representation(
+                checkpoint, sampled_train, normal, defects, args, device
+            )
+        )
+
+    elif checkpoint is not None and method == "kernel_pca":
+        print(f"[checkpoint] loading Kernel PCA: {checkpoint}")
+        payload = joblib.load(checkpoint)
+        scaler, reducer = payload["scaler"], payload["reducer"]
+        transform = lambda x: reducer.transform(scaler.transform(x))
+        start = time.perf_counter()
+        train_z = transform_batches(transform, sampled_train, args.transform_batch_size)
+        normal_z = transform_batches(transform, normal, args.transform_batch_size)
+        defects_z = {
+            k: transform_batches(transform, v, args.transform_batch_size)
+            for k, v in defects.items()
+        }
+        transform_seconds = time.perf_counter() - start
+        fit_seconds = 0.0
+        extra = {
+            "checkpoint_reused": 1.0,
+            "gamma": float(getattr(reducer, "gamma", np.nan)),
+        }
+
+    elif checkpoint is not None and method == "transformer":
+        print(f"[checkpoint] loading Transformer: {checkpoint}")
+        train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = (
+            load_transformer_representation(
+                checkpoint, sequences, selected_indices, cached_test, args, device
+            )
+        )
 
     elif method == "pca":
+        print("[checkpoint] PCA checkpoint not found; fitting from scratch")
         reducer = PCA(n_components=args.latent_dim, random_state=args.seed)
-        start = time.perf_counter(); train_z = reducer.fit_transform(sampled_train); fit_seconds = time.perf_counter() - start
-        start = time.perf_counter(); normal_z = reducer.transform(normal); defects_z = {k: reducer.transform(v) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        train_z = reducer.fit_transform(sampled_train)
+        fit_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        normal_z = reducer.transform(normal)
+        defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+        transform_seconds = time.perf_counter() - start
         joblib.dump(reducer, directory / "pca.joblib")
-        extra = {"explained_variance": float(reducer.explained_variance_ratio_.sum())}
+        extra = {
+            "checkpoint_reused": 0.0,
+            "explained_variance": float(reducer.explained_variance_ratio_.sum()),
+        }
 
     elif method == "umap":
+        print("[checkpoint] UMAP checkpoint not found; fitting from scratch")
         try:
             import umap
         except ImportError as exc:
@@ -1300,49 +1542,55 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
             n_components=args.umap_dim, n_neighbors=args.umap_neighbors,
             min_dist=args.umap_min_dist, metric="euclidean", random_state=args.seed,
         )
-        start = time.perf_counter(); train_z = reducer.fit_transform(sampled_train); fit_seconds = time.perf_counter() - start
-        start = time.perf_counter(); normal_z = reducer.transform(normal); defects_z = {k: reducer.transform(v) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
-        joblib.dump(reducer, directory / "umap.joblib"); extra = {}
+        start = time.perf_counter()
+        train_z = reducer.fit_transform(sampled_train)
+        fit_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        normal_z = reducer.transform(normal)
+        defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+        transform_seconds = time.perf_counter() - start
+        joblib.dump(reducer, directory / "umap.joblib")
+        extra = {"checkpoint_reused": 0.0}
 
     elif method == "autoencoder":
-        train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_autoencoder(sampled_train, normal, defects, args, directory, device)
+        print("[checkpoint] Autoencoder checkpoint not found; fitting from scratch")
+        train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_autoencoder(
+            sampled_train, normal, defects, args, directory, device
+        )
+        extra["checkpoint_reused"] = 0.0
 
     elif method == "kernel_pca":
-        # No second sampling: Kernel PCA receives the exact nominal reference
-        # selected once in main(), just like every other method.
+        print("[checkpoint] Kernel PCA checkpoint not found; fitting from scratch")
         train_input = sampled_train
-        scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
+        scaler = StandardScaler()
+        scaled = scaler.fit_transform(train_input)
         gamma = args.kpca_gamma if args.kpca_gamma > 0 else 1.0 / scaled.shape[1]
         reducer = KernelPCA(
             n_components=args.latent_dim, kernel="rbf", gamma=gamma,
             eigen_solver="randomized", random_state=args.seed,
             remove_zero_eig=True, n_jobs=-1,
         )
-        start = time.perf_counter(); train_z = reducer.fit_transform(scaled); fit_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        train_z = reducer.fit_transform(scaled)
+        fit_seconds = time.perf_counter() - start
         transform = lambda x: reducer.transform(scaler.transform(x))
-        start = time.perf_counter(); normal_z = transform_batches(transform, normal, args.transform_batch_size); defects_z = {k: transform_batches(transform, v, args.transform_batch_size) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
-        joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "kernel_pca.joblib"); extra = {"gamma": float(gamma)}
-
-    # elif method == "sparse_pca":
-    #     # No second sampling: Sparse PCA receives the exact nominal reference
-    #     # selected once in main(), just like every other method.
-    #     train_input = sampled_train
-    #     scaler = StandardScaler(); scaled = scaler.fit_transform(train_input)
-    #     reducer = SparsePCA(
-    #         n_components=args.latent_dim, alpha=args.spca_alpha,
-    #         ridge_alpha=args.spca_ridge_alpha, max_iter=args.spca_max_iter,
-    #         tol=args.spca_tol, method="lars", random_state=args.seed, n_jobs=-1,
-    #     )
-    #     start = time.perf_counter(); train_z = reducer.fit_transform(scaled); fit_seconds = time.perf_counter() - start
-    #     transform = lambda x: reducer.transform(scaler.transform(x))
-    #     start = time.perf_counter(); normal_z = transform_batches(transform, normal, args.transform_batch_size); defects_z = {k: transform_batches(transform, v, args.transform_batch_size) for k, v in defects.items()}; transform_seconds = time.perf_counter() - start
-    #     joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "sparse_pca.joblib"); extra = {}
+        start = time.perf_counter()
+        normal_z = transform_batches(transform, normal, args.transform_batch_size)
+        defects_z = {
+            k: transform_batches(transform, v, args.transform_batch_size)
+            for k, v in defects.items()
+        }
+        transform_seconds = time.perf_counter() - start
+        joblib.dump({"scaler": scaler, "reducer": reducer}, directory / "kernel_pca.joblib")
+        extra = {"checkpoint_reused": 0.0, "gamma": float(gamma)}
 
     elif method == "transformer":
+        print("[checkpoint] Transformer checkpoint not found; fitting from scratch")
         train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_transformer(
             sequences, patch_grid, patchcore_model, test_loader,
             selected_indices, args, directory, device, cached_test=cached_test
         )
+        extra["checkpoint_reused"] = 0.0
     else:
         raise ValueError(method)
 
@@ -1359,21 +1607,13 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
         args.retrieval_examples_per_defect,
     )
 
-    # Optional second stage: project this ALREADY reduced representation
-    # (for example PCA 64-D) to 2-D/3-D for visualization.
-    save_projection_stage(
-        method, train_z, normal_z, defects_z, directory, args
-    )
+    save_projection_stage(method, train_z, normal_z, defects_z, directory, args)
 
     return evaluate(
-        method,
-        train_z,
-        normal_z,
-        defects_z,
-        args.nominal_percentile,
-        fit_seconds,
-        transform_seconds,
-        extra,
+        method, train_z, normal_z, defects_z, args.nominal_percentile,
+        fit_seconds, transform_seconds, extra,
+        nn_query_batch_size=args.nn_query_batch_size,
+        nn_backend=args.nn_backend,
     )
 
 
@@ -1401,6 +1641,18 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--feature-cache-root", type=Path, default=None,
                    help="Root containing category feature-cache folders; required when --source features")
     p.add_argument("--output-dir", type=Path, default=Path("dim_reduction_results"))
+    p.add_argument(
+        "--checkpoint-root", type=Path, default=None,
+        help=(
+            "Existing dimensionality-reduction result root containing "
+            "<category>/<subsampling>/<method>/<checkpoint>. If a checkpoint "
+            "exists it is loaded instead of refitting."
+        ),
+    )
+    p.add_argument(
+        "--force-refit", action="store_true",
+        help="Ignore existing reducer/checkpoint files and train the first-stage method again.",
+    )
     p.add_argument("--categories", nargs="+", default=["bottle"],
                    help="One or more categories, comma-separated values, or 'all'")
     p.add_argument("--methods", nargs="+", default=["all"], help="all or method names; comma-separated also works")
@@ -1418,6 +1670,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--anomaly-fraction-threshold", type=float, default=0.10)
     p.add_argument("--nominal-percentile", type=float, default=95.0)
     p.add_argument("--transform-batch-size", type=int, default=1000)
+    p.add_argument("--nn-query-batch-size", type=int, default=4096)
+    p.add_argument(
+        "--nn-backend", choices=("auto", "faiss", "sklearn"), default="auto",
+        help="1-NN evaluation backend. auto prefers exact FAISS IndexFlatL2 when installed.",
+    )
     p.add_argument("--visualization-points-per-class", type=int, default=2000)
     p.add_argument("--retrieval-examples-per-defect", type=int, default=3)
 
@@ -1537,6 +1794,7 @@ def run_one_configuration(
                 sequences, patch_grid, prepared.get("patchcore_model"),
                 prepared.get("test_loader"), args, method_dir, device,
                 cached_test=prepared.get("cached_test"),
+                category=category, subsampling=subsampling,
             )
             save_result(result, method_dir)
             results.append(result)
@@ -1604,6 +1862,8 @@ def main() -> None:
     args.repo_root = args.repo_root.resolve()
     add_repo_src(args.repo_root)
     args.output_dir = args.output_dir.resolve()
+    if args.checkpoint_root is not None:
+        args.checkpoint_root = args.checkpoint_root.resolve()
 
     print("Selected configuration:")
     print(f"  source:       {args.source}")
@@ -1611,6 +1871,9 @@ def main() -> None:
     print(f"  subsampling:  {subsamplings}")
     print(f"  methods:      {methods}")
     print(f"  projections:  {args.projection_methods_parsed or ['none']} -> {args.projection_dims}")
+    print(f"  checkpoint:   {args.checkpoint_root if args.checkpoint_root else 'current output folders'}")
+    print(f"  force refit:  {args.force_refit}")
+    print(f"  NN backend:   {args.nn_backend}")
     print(f"  device:       {device}")
 
     completed = []
