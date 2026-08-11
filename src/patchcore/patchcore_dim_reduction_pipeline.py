@@ -2418,10 +2418,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--transformer-decoder-layers", type=int, default=4)
     p.add_argument("--transformer-dropout", type=float, default=0.1)
 
-    P.add_argument("--deep-svdd-epochs", type=int, default=150)
-    P.add_argument( "--deep-svdd-lr", type=float, default=1e-4)
-    P.add_argument("--deep-svdd-batch-size", type=int, default=256)
-    P.add_argument("--deep-svdd-weight-decay", type=float, default=5e-7)
+    p.add_argument("--deep-svdd-epochs", type=int, default=150)
+    p.add_argument( "--deep-svdd-lr", type=float, default=1e-4)
+    p.add_argument("--deep-svdd-batch-size", type=int, default=256)
+    p.add_argument("--deep-svdd-weight-decay", type=float, default=5e-7)
     
     return p
 
