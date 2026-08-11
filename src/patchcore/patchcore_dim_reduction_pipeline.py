@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 
 random  : uniform random sample (only when explicitly requested)
@@ -466,7 +467,7 @@ def load_cached_category(cache_root: Path, category: str, args) -> Dict[str, Any
 
     return {
         "all_train": all_train,
-        "sequences": sequences.astype(np.float16) if "transformer" in parse_methods(args.methods) else None,
+        "sequences": sequences.astype(np.float16) if ("transformer" in parse_methods(args.methods) or any(m == "transformer" for m, _ in getattr(args, "reduction_chain_parsed", []))) else None,
         "patch_grid": patch_grid,
         "normal": normal,
         "defects": defects,
@@ -1630,6 +1631,620 @@ def make_comparison(results: Sequence[MethodResult]) -> Tuple[pd.DataFrame, pd.D
     return long_table, wide.reset_index()
 
 
+
+# -----------------------------------------------------------------------------
+# Sequential dimensionality-reduction chains
+# -----------------------------------------------------------------------------
+
+def parse_reduction_chain(values: Optional[Sequence[str]]) -> List[Tuple[str, int]]:
+    """Parse e.g. ``pca:64 umap:32 pca:8 umap:3``.
+
+    Each stage is fitted ONLY on the current nominal training/reference features.
+    Normal-test and defect-test features are transform-only at every stage.
+    """
+    if not values:
+        return []
+
+    tokens: List[str] = []
+    for value in values:
+        tokens.extend(x.strip().lower() for x in value.split(",") if x.strip())
+
+    stages: List[Tuple[str, int]] = []
+    valid = {"pca", "umap", "autoencoder", "kernel_pca", "transformer"}
+    for token in tokens:
+        if ":" not in token:
+            raise ValueError(
+                f"Invalid chain stage '{token}'. Use METHOD:DIM, e.g. pca:64 or umap:3."
+            )
+        method_token, dim_token = token.rsplit(":", 1)
+        method = ALIASES.get(method_token.strip(), method_token.strip())
+        if method not in valid:
+            raise ValueError(
+                f"Unknown chain method '{method}'. Valid: {', '.join(sorted(valid))}"
+            )
+        try:
+            dim = int(dim_token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid output dimension in chain stage '{token}'.") from exc
+        if dim <= 0:
+            raise ValueError(f"Chain output dimensions must be positive; got {dim} in '{token}'.")
+        stages.append((method, dim))
+
+    for index, (method, _) in enumerate(stages):
+        if method == "transformer" and index != 0:
+            raise ValueError(
+                "Transformer is currently supported only as the FIRST stage of a sequential "
+                "chain because it requires intact image patch sequences. Example: "
+                "transformer:64 pca:16 umap:3."
+            )
+    return stages
+
+
+def chain_name(stages: Sequence[Tuple[str, int]]) -> str:
+    return "__".join(f"{method}{dim}" for method, dim in stages)
+
+
+def _checkpoint_dims_ok(method: str, checkpoint: Path, input_dim: int, output_dim: int) -> bool:
+    """Best-effort dimensionality check before reusing a stage checkpoint."""
+    try:
+        if method == "pca":
+            reducer = joblib.load(checkpoint)
+            in_dim = int(getattr(reducer, "n_features_in_", input_dim))
+            out_dim = int(getattr(reducer, "n_components_", getattr(reducer, "n_components", output_dim)))
+            return in_dim == input_dim and out_dim == output_dim
+
+        if method == "umap":
+            reducer = joblib.load(checkpoint)
+            out_dim = int(getattr(reducer, "n_components", output_dim))
+            raw = getattr(reducer, "_raw_data", None)
+            in_dim = int(raw.shape[1]) if raw is not None and getattr(raw, "ndim", 0) == 2 else input_dim
+            return in_dim == input_dim and out_dim == output_dim
+
+        if method == "kernel_pca":
+            payload = joblib.load(checkpoint)
+            scaler, reducer = payload["scaler"], payload["reducer"]
+            in_dim = int(getattr(scaler, "n_features_in_", input_dim))
+            out_dim = int(getattr(reducer, "n_components", output_dim))
+            return in_dim == input_dim and out_dim == output_dim
+
+        if method in {"autoencoder", "transformer"}:
+            ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            in_dim = int(ckpt.get("input_dim", input_dim))
+            out_dim = int(ckpt.get("latent_dim", output_dim))
+            return in_dim == input_dim and out_dim == output_dim
+    except Exception as exc:
+        print(f"[chain checkpoint] could not validate {checkpoint}: {type(exc).__name__}: {exc}")
+        return False
+    return False
+
+
+def resolve_chain_checkpoint(
+    stage_index: int,
+    method: str,
+    input_dim: int,
+    output_dim: int,
+    stage_dir: Path,
+    args,
+    category: str,
+    subsampling: str,
+) -> Optional[Path]:
+    """Find a reusable checkpoint for one chain stage.
+
+    - Any stage may reuse a checkpoint already saved in its own chain stage folder.
+    - Stage 1 may additionally reuse the legacy first-stage checkpoint tree supplied
+      via --checkpoint-root, because its input is still the original PatchCore space.
+    - Later stages never reuse a legacy checkpoint trained on a different prefix.
+    """
+    if args.force_refit:
+        return None
+
+    filename = checkpoint_filename(method)
+    if filename is None:
+        return None
+
+    candidates: List[Path] = [stage_dir / filename]
+    if stage_index == 0 and args.checkpoint_root is not None:
+        candidates.insert(
+            0,
+            args.checkpoint_root.resolve() / category / subsampling / method / filename,
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            if _checkpoint_dims_ok(method, candidate, input_dim, output_dim):
+                return candidate
+            print(
+                f"[chain checkpoint] ignoring incompatible checkpoint: {candidate} "
+                f"(wanted {input_dim}D -> {output_dim}D)"
+            )
+    return None
+
+
+def _run_chain_autoencoder(
+    train: np.ndarray,
+    normal: np.ndarray,
+    defects: Mapping[str, np.ndarray],
+    output_dim: int,
+    args,
+    directory: Path,
+    device: torch.device,
+):
+    old_latent = args.latent_dim
+    args.latent_dim = output_dim
+    try:
+        return run_autoencoder(train, normal, defects, args, directory, device)
+    finally:
+        args.latent_dim = old_latent
+
+
+def _run_chain_transformer_first_stage(
+    sequences,
+    patch_grid,
+    patchcore_model,
+    test_loader,
+    selected_indices,
+    cached_test,
+    output_dim: int,
+    args,
+    directory: Path,
+    device: torch.device,
+):
+    old_latent = args.latent_dim
+    args.latent_dim = output_dim
+    try:
+        return run_transformer(
+            sequences, patch_grid, patchcore_model, test_loader,
+            selected_indices, args, directory, device, cached_test=cached_test,
+        )
+    finally:
+        args.latent_dim = old_latent
+
+
+def apply_chain_stage(
+    stage_index: int,
+    method: str,
+    output_dim: int,
+    train: np.ndarray,
+    normal: np.ndarray,
+    defects: Mapping[str, np.ndarray],
+    args,
+    stage_dir: Path,
+    device: torch.device,
+    category: str,
+    subsampling: str,
+    *,
+    sequences=None,
+    patch_grid=None,
+    patchcore_model=None,
+    test_loader=None,
+    selected_indices=None,
+    cached_test=None,
+):
+    """Fit/load one sequential stage on nominal train and transform test data."""
+    input_dim = int(train.shape[1])
+    if output_dim >= input_dim:
+        raise ValueError(
+            f"Sequential reduction must reduce dimension at every stage; "
+            f"stage {stage_index + 1} requested {input_dim}D -> {output_dim}D."
+        )
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = resolve_chain_checkpoint(
+        stage_index, method, input_dim, output_dim, stage_dir,
+        args, category, subsampling,
+    )
+
+    fit_seconds = 0.0
+    transform_seconds = 0.0
+    extra: Dict[str, Any] = {}
+    checkpoint_reused_from: Optional[str] = None
+
+    if checkpoint is not None:
+        checkpoint_reused_from = str(checkpoint)
+        print(
+            f"[chain stage {stage_index + 1}] loading {method} checkpoint: {checkpoint}"
+        )
+
+        if method == "pca":
+            reducer = joblib.load(checkpoint)
+            start = time.perf_counter()
+            train_z = reducer.transform(train)
+            normal_z = reducer.transform(normal)
+            defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+            transform_seconds = time.perf_counter() - start
+            extra["explained_variance"] = float(reducer.explained_variance_ratio_.sum())
+
+        elif method == "umap":
+            reducer = joblib.load(checkpoint)
+            start = time.perf_counter()
+            train_z = reducer.transform(train)
+            normal_z = reducer.transform(normal)
+            defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+            transform_seconds = time.perf_counter() - start
+
+        elif method == "kernel_pca":
+            payload = joblib.load(checkpoint)
+            scaler, reducer = payload["scaler"], payload["reducer"]
+            transform = lambda x: reducer.transform(scaler.transform(x))
+            start = time.perf_counter()
+            train_z = transform_batches(transform, train, args.transform_batch_size)
+            normal_z = transform_batches(transform, normal, args.transform_batch_size)
+            defects_z = {
+                k: transform_batches(transform, v, args.transform_batch_size)
+                for k, v in defects.items()
+            }
+            transform_seconds = time.perf_counter() - start
+            extra["gamma"] = float(getattr(reducer, "gamma", np.nan))
+
+        elif method == "autoencoder":
+            train_z, normal_z, defects_z, _, transform_seconds, loaded_extra = (
+                load_autoencoder_representation(
+                    checkpoint, train, normal, defects, args, device
+                )
+            )
+            extra.update(loaded_extra)
+
+        elif method == "transformer":
+            if stage_index != 0:
+                raise ValueError("Transformer can only be the first chain stage.")
+            train_z, normal_z, defects_z, _, transform_seconds, loaded_extra = (
+                load_transformer_representation(
+                    checkpoint, sequences, selected_indices, cached_test, args, device
+                )
+            )
+            extra.update(loaded_extra)
+
+        else:
+            raise ValueError(method)
+
+        extra["checkpoint_reused"] = 1.0
+
+    else:
+        print(
+            f"[chain stage {stage_index + 1}] fitting {method}: "
+            f"{input_dim}D -> {output_dim}D on NOMINAL reference only"
+        )
+
+        if method == "pca":
+            reducer = PCA(n_components=output_dim, random_state=args.seed)
+            start = time.perf_counter()
+            train_z = reducer.fit_transform(train)
+            fit_seconds = time.perf_counter() - start
+            start = time.perf_counter()
+            normal_z = reducer.transform(normal)
+            defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+            transform_seconds = time.perf_counter() - start
+            joblib.dump(reducer, stage_dir / "pca.joblib")
+            extra["explained_variance"] = float(reducer.explained_variance_ratio_.sum())
+
+        elif method == "umap":
+            try:
+                import umap
+            except ImportError as exc:
+                raise ImportError("Install UMAP with: pip install umap-learn") from exc
+            reducer = umap.UMAP(
+                n_components=output_dim,
+                n_neighbors=args.umap_neighbors,
+                min_dist=args.umap_min_dist,
+                metric="euclidean",
+                random_state=args.seed,
+            )
+            start = time.perf_counter()
+            train_z = reducer.fit_transform(train)
+            fit_seconds = time.perf_counter() - start
+            start = time.perf_counter()
+            normal_z = reducer.transform(normal)
+            defects_z = {k: reducer.transform(v) for k, v in defects.items()}
+            transform_seconds = time.perf_counter() - start
+            joblib.dump(reducer, stage_dir / "umap.joblib")
+
+        elif method == "autoencoder":
+            train_z, normal_z, defects_z, fit_seconds, transform_seconds, ae_extra = (
+                _run_chain_autoencoder(
+                    train, normal, defects, output_dim, args, stage_dir, device
+                )
+            )
+            extra.update(ae_extra)
+
+        elif method == "kernel_pca":
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(train)
+            gamma = args.kpca_gamma if args.kpca_gamma > 0 else 1.0 / scaled.shape[1]
+            reducer = KernelPCA(
+                n_components=output_dim,
+                kernel="rbf",
+                gamma=gamma,
+                eigen_solver="randomized",
+                random_state=args.seed,
+                remove_zero_eig=True,
+                n_jobs=-1,
+            )
+            start = time.perf_counter()
+            train_z = reducer.fit_transform(scaled)
+            fit_seconds = time.perf_counter() - start
+            transform = lambda x: reducer.transform(scaler.transform(x))
+            start = time.perf_counter()
+            normal_z = transform_batches(transform, normal, args.transform_batch_size)
+            defects_z = {
+                k: transform_batches(transform, v, args.transform_batch_size)
+                for k, v in defects.items()
+            }
+            transform_seconds = time.perf_counter() - start
+            joblib.dump({"scaler": scaler, "reducer": reducer}, stage_dir / "kernel_pca.joblib")
+            extra["gamma"] = float(gamma)
+
+        elif method == "transformer":
+            if stage_index != 0:
+                raise ValueError("Transformer can only be the first chain stage.")
+            train_z, normal_z, defects_z, fit_seconds, transform_seconds, tr_extra = (
+                _run_chain_transformer_first_stage(
+                    sequences, patch_grid, patchcore_model, test_loader,
+                    selected_indices, cached_test, output_dim,
+                    args, stage_dir, device,
+                )
+            )
+            extra.update(tr_extra)
+
+        else:
+            raise ValueError(method)
+
+        extra["checkpoint_reused"] = 0.0
+
+    train_z = np.asarray(train_z, dtype=np.float32)
+    normal_z = np.asarray(normal_z, dtype=np.float32)
+    defects_z = {k: np.asarray(v, dtype=np.float32) for k, v in defects_z.items()}
+
+    if train_z.shape[1] != output_dim:
+        raise RuntimeError(
+            f"Chain stage {stage_index + 1} ({method}) returned {train_z.shape[1]}D, "
+            f"expected {output_dim}D."
+        )
+
+    np.save(stage_dir / "nominal_reference.npy", train_z)
+    np.save(stage_dir / "normal_test.npy", normal_z)
+    np.savez_compressed(
+        stage_dir / "defects_test.npz",
+        **{f"defect__{k}": v for k, v in defects_z.items()},
+    )
+
+    stage_config = {
+        "stage": stage_index + 1,
+        "method": method,
+        "input_dimension": input_dim,
+        "output_dimension": output_dim,
+        "fit_on": "nominal_reference_only",
+        "normal_test_policy": "transform_only",
+        "defect_test_policy": "transform_only",
+        "checkpoint_reused_from": checkpoint_reused_from,
+        "fit_seconds": fit_seconds,
+        "transform_seconds": transform_seconds,
+        **extra,
+    }
+    (stage_dir / "stage_config.json").write_text(
+        json.dumps(stage_config, indent=2, default=str), encoding="utf-8"
+    )
+
+    return train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra
+
+
+def save_chain_lowdim_plot(
+    chain_label: str,
+    train: np.ndarray,
+    normal: np.ndarray,
+    defects: Mapping[str, np.ndarray],
+    directory: Path,
+    args,
+) -> None:
+    """Plot a final 2-D/3-D chain output without fitting anything else."""
+    dim = int(train.shape[1])
+    if dim not in (2, 3):
+        return
+
+    rng = np.random.default_rng(args.seed)
+
+    def sample(values: np.ndarray) -> np.ndarray:
+        limit = args.projection_points_per_class
+        if limit <= 0 or len(values) <= limit:
+            return values
+        idx = rng.choice(len(values), limit, replace=False)
+        return values[idx]
+
+    normal_plot = sample(normal)
+    defects_plot = {k: sample(v) for k, v in defects.items()}
+
+    if dim == 2:
+        plt.figure(figsize=(10, 8))
+        plt.scatter(normal_plot[:, 0], normal_plot[:, 1], s=9, alpha=0.18, label="normal")
+        for defect_type, points in sorted(defects_plot.items()):
+            plt.scatter(
+                points[:, 0], points[:, 1], s=12, alpha=0.42,
+                label=defect_type.replace("_", " "),
+            )
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.title(chain_label)
+        plt.grid(alpha=0.15)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(directory / "chain_2d.png", dpi=180)
+        plt.close()
+        return
+
+    fig = plt.figure(figsize=(11, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(
+        normal_plot[:, 0], normal_plot[:, 1], normal_plot[:, 2],
+        s=9, alpha=0.18, label="normal",
+    )
+    for defect_type, points in sorted(defects_plot.items()):
+        ax.scatter(
+            points[:, 0], points[:, 1], points[:, 2],
+            s=12, alpha=0.42, label=defect_type.replace("_", " "),
+        )
+    ax.set_xlabel("Dimension 1")
+    ax.set_ylabel("Dimension 2")
+    ax.set_zlabel("Dimension 3")
+    ax.set_title(chain_label)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(directory / "chain_3d.png", dpi=180)
+    plt.close(fig)
+
+    if args.projection_html:
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            warnings.warn("plotly is not installed; skipping chain_3d.html")
+        else:
+            traces = [
+                go.Scatter3d(
+                    x=normal_plot[:, 0], y=normal_plot[:, 1], z=normal_plot[:, 2],
+                    mode="markers", name="normal",
+                    marker={"size": 2, "opacity": 0.25},
+                )
+            ]
+            for defect_type, points in sorted(defects_plot.items()):
+                traces.append(
+                    go.Scatter3d(
+                        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+                        mode="markers", name=defect_type.replace("_", " "),
+                        marker={"size": 3, "opacity": 0.55},
+                    )
+                )
+            fig_html = go.Figure(data=traces)
+            fig_html.update_layout(
+                title=chain_label,
+                scene={
+                    "xaxis_title": "Dimension 1",
+                    "yaxis_title": "Dimension 2",
+                    "zaxis_title": "Dimension 3",
+                },
+            )
+            fig_html.write_html(directory / "chain_3d.html", include_plotlyjs="cdn")
+
+
+def run_reduction_chain(
+    args,
+    stages: Sequence[Tuple[str, int]],
+    category: str,
+    subsampling: str,
+    device: torch.device,
+    prepared: Dict[str, Any],
+    sampled_train: np.ndarray,
+    selected_indices: np.ndarray,
+    run_dir: Path,
+) -> Path:
+    """Run an ordered sequential reduction chain.
+
+    Example: 1024 -> PCA64 -> UMAP32 -> PCA8 -> UMAP3.
+    Every stage fits on the CURRENT nominal reference only. Defects are never used
+    in fitting or model selection inside this function.
+    """
+    slug = chain_name(stages)
+    chain_dir = run_dir / "chains" / slug
+    chain_dir.mkdir(parents=True, exist_ok=True)
+
+    train_current = np.asarray(sampled_train, dtype=np.float32)
+    normal_current = np.asarray(prepared["normal"], dtype=np.float32)
+    defects_current = {
+        k: np.asarray(v, dtype=np.float32) for k, v in prepared["defects"].items()
+    }
+
+    config = {
+        "category": category,
+        "subsampling": subsampling,
+        "source": args.source,
+        "chain": [
+            {"stage": i + 1, "method": method, "output_dim": dim}
+            for i, (method, dim) in enumerate(stages)
+        ],
+        "chain_name": slug,
+        "input_dimension": int(train_current.shape[1]),
+        "fit_policy": "nominal_reference_only_at_every_stage",
+        "test_policy": "normal_and_defects_transform_only",
+        "selected_reference_count": int(len(train_current)),
+    }
+    (chain_dir / "chain_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
+
+    print("\n" + "=" * 80)
+    print(f"SEQUENTIAL CHAIN: {slug}")
+    print("  " + " -> ".join([f"{train_current.shape[1]}D"] + [f"{m.upper()}{d}" for m, d in stages]))
+    print("  FIT POLICY: nominal reference ONLY at every stage")
+    print("  TEST POLICY: normal + defects are transform-only")
+
+    stage_summaries = []
+    for stage_index, (method, output_dim) in enumerate(stages):
+        input_dim = int(train_current.shape[1])
+        stage_dir = chain_dir / f"stage_{stage_index + 1:02d}_{method}_{output_dim}d"
+
+        train_current, normal_current, defects_current, fit_s, transform_s, extra = (
+            apply_chain_stage(
+                stage_index, method, output_dim,
+                train_current, normal_current, defects_current,
+                args, stage_dir, device, category, subsampling,
+                sequences=prepared.get("sequences"),
+                patch_grid=prepared.get("patch_grid"),
+                patchcore_model=prepared.get("patchcore_model"),
+                test_loader=prepared.get("test_loader"),
+                selected_indices=selected_indices,
+                cached_test=prepared.get("cached_test"),
+            )
+        )
+
+        stage_summaries.append({
+            "stage": stage_index + 1,
+            "method": method,
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "fit_seconds": fit_s,
+            "transform_seconds": transform_s,
+            **extra,
+        })
+
+        if args.chain_evaluate_each_stage:
+            result = evaluate(
+                f"stage_{stage_index + 1:02d}_{method}_{output_dim}d",
+                train_current, normal_current, defects_current,
+                args.nominal_percentile, fit_s, transform_s, extra,
+                nn_query_batch_size=args.nn_query_batch_size,
+                nn_backend=args.nn_backend,
+            )
+            save_result(result, stage_dir / "evaluation")
+
+        if output_dim in (2, 3):
+            prefix = " -> ".join(
+                f"{m.upper()}{d}" for m, d in stages[: stage_index + 1]
+            )
+            save_chain_lowdim_plot(
+                prefix, train_current, normal_current, defects_current,
+                stage_dir, args,
+            )
+
+    # Always evaluate the final representation.
+    final_method, final_dim = stages[-1]
+    final_extra = {
+        "chain_length": float(len(stages)),
+        "final_dimension": float(final_dim),
+    }
+    final_result = evaluate(
+        slug, train_current, normal_current, defects_current,
+        args.nominal_percentile,
+        float(sum(x["fit_seconds"] for x in stage_summaries)),
+        float(sum(x["transform_seconds"] for x in stage_summaries)),
+        final_extra,
+        nn_query_batch_size=args.nn_query_batch_size,
+        nn_backend=args.nn_backend,
+    )
+    save_result(final_result, chain_dir / "final_evaluation")
+
+    (chain_dir / "stage_summary.json").write_text(
+        json.dumps(stage_summaries, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"[chain] finished: {chain_dir}")
+    return chain_dir
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="PatchCore dimensionality-reduction pipeline")
     p.add_argument("--source", choices=("data", "features"), default="features",
@@ -1656,6 +2271,18 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--categories", nargs="+", default=["bottle"],
                    help="One or more categories, comma-separated values, or 'all'")
     p.add_argument("--methods", nargs="+", default=["all"], help="all or method names; comma-separated also works")
+    p.add_argument(
+        "--reduction-chain", nargs="+", default=None,
+        help=(
+            "Optional sequential reduction chain. Example: "
+            "--reduction-chain pca:64 umap:32 pca:8 umap:3. "
+            "When supplied, chain mode runs instead of the legacy --methods/--projection-methods path."
+        ),
+    )
+    p.add_argument(
+        "--chain-evaluate-each-stage", action="store_true",
+        help="Also compute/save nearest-nominal evaluation metrics after every intermediate chain stage. Final stage is always evaluated.",
+    )
     p.add_argument("--subsampling", nargs="+", default=["coreset"],
                    help="One or more of: random coreset none all")
     p.add_argument("--subsample-percentage", type=float, default=0.1)
@@ -1739,6 +2366,18 @@ def validate(args) -> None:
         raise ValueError("--projection-dims currently accepts only 2 and/or 3")
     if args.projection_points_per_class == 0:
         raise ValueError("--projection-points-per-class must be positive or negative for unlimited")
+    chain = getattr(args, "reduction_chain_parsed", [])
+    if chain:
+        previous_dim = 1024  # PatchCore cache/model output in this pipeline
+        for index, (method, dim) in enumerate(chain):
+            if dim >= previous_dim:
+                raise ValueError(
+                    f"--reduction-chain must strictly decrease dimensions; "
+                    f"stage {index + 1} requests {previous_dim}D -> {dim}D."
+                )
+            previous_dim = dim
+            if method == "transformer" and index != 0:
+                raise ValueError("Transformer is supported only as the first chain stage.")
 
 
 def run_one_configuration(
@@ -1783,6 +2422,15 @@ def run_one_configuration(
     print(f"Normal test patches: {normal.shape}")
     for name, values in defects.items():
         print(f"{name}: {values.shape}")
+
+    chain = getattr(args, "reduction_chain_parsed", [])
+    if chain:
+        run_reduction_chain(
+            args, chain, category, subsampling, device, prepared,
+            sampled_train, selected_indices, run_dir,
+        )
+        print(f"Finished chain configuration: {run_dir}")
+        return run_dir
 
     results: List[MethodResult] = []
     for method in methods:
@@ -1830,7 +2478,7 @@ def prepare_category_from_data(args, category, methods, device) -> Dict[str, Any
     print(f"Testing images: {len(test_dataset)}")
 
     all_train, sequences, patch_grid = collect_training_embeddings(
-        model, train_loader, keep_sequences="transformer" in methods
+        model, train_loader, keep_sequences=("transformer" in methods or any(m == "transformer" for m, _ in getattr(args, "reduction_chain_parsed", [])))
     )
     normal, defects = collect_test_embeddings(
         model, test_loader, args.anomaly_fraction_threshold,
@@ -1851,6 +2499,7 @@ def prepare_category_from_data(args, category, methods, device) -> Dict[str, Any
 
 def main() -> None:
     args = parser().parse_args()
+    args.reduction_chain_parsed = parse_reduction_chain(args.reduction_chain)
     validate(args)
     methods = parse_methods(args.methods)
     args.projection_methods_parsed = parse_projection_methods(args.projection_methods)
@@ -1869,8 +2518,14 @@ def main() -> None:
     print(f"  source:       {args.source}")
     print(f"  categories:   {categories}")
     print(f"  subsampling:  {subsamplings}")
-    print(f"  methods:      {methods}")
-    print(f"  projections:  {args.projection_methods_parsed or ['none']} -> {args.projection_dims}")
+    if args.reduction_chain_parsed:
+        print(f"  mode:         sequential chain")
+        print(f"  chain:        {args.reduction_chain_parsed}")
+        print("  fit policy:   NOMINAL reference only at every stage")
+        print("  test policy:  normal + defects transform-only")
+    else:
+        print(f"  methods:      {methods}")
+        print(f"  projections:  {args.projection_methods_parsed or ['none']} -> {args.projection_dims}")
     print(f"  checkpoint:   {args.checkpoint_root if args.checkpoint_root else 'current output folders'}")
     print(f"  force refit:  {args.force_refit}")
     print(f"  NN backend:   {args.nn_backend}")
@@ -1909,7 +2564,8 @@ def main() -> None:
         "source": args.source,
         "categories": categories,
         "subsampling": subsamplings,
-        "methods": methods,
+        "methods": methods if not args.reduction_chain_parsed else None,
+        "reduction_chain": args.reduction_chain_parsed,
         "completed": completed,
         "failures": failures,
     }
