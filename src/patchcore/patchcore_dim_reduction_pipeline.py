@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 
 random  : uniform random sample (only when explicitly requested)
@@ -36,7 +35,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -116,6 +115,41 @@ def parse_methods(values: Sequence[str]) -> List[str]:
             result.append(token)
     if not result:
         raise ValueError("No methods selected.")
+    return result
+
+
+def parse_categories(values: Sequence[str]) -> List[str]:
+    tokens: List[str] = []
+    for value in values:
+        tokens.extend(x.strip().lower() for x in value.split(",") if x.strip())
+    if "all" in tokens:
+        return list(MVTEC_CATEGORIES)
+    result: List[str] = []
+    for token in tokens:
+        if token not in MVTEC_CATEGORIES:
+            raise ValueError(f"Unknown category '{token}'. Valid: all, {', '.join(MVTEC_CATEGORIES)}")
+        if token not in result:
+            result.append(token)
+    if not result:
+        raise ValueError("No categories selected.")
+    return result
+
+
+def parse_subsamplings(values: Sequence[str]) -> List[str]:
+    valid = ("random", "coreset", "none")
+    tokens: List[str] = []
+    for value in values:
+        tokens.extend(x.strip().lower() for x in value.split(",") if x.strip())
+    if "all" in tokens:
+        return list(valid)
+    result: List[str] = []
+    for token in tokens:
+        if token not in valid:
+            raise ValueError(f"Unknown subsampling '{token}'. Valid: all, {', '.join(valid)}")
+        if token not in result:
+            result.append(token)
+    if not result:
+        raise ValueError("No subsampling methods selected.")
     return result
 
 
@@ -291,24 +325,35 @@ def subsample_reference(
     percentage: float,
     seed: int,
     device: torch.device,
+    preselected_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     n = len(features)
     if mode == "none":
         return features, np.arange(n, dtype=np.int64)
 
+    target_size = max(1, int(round(n * percentage)))
+    if max_patches > 0:
+        target_size = min(target_size, max_patches)
+    target_size = min(target_size, n)
+
     if mode == "random":
-        size = n if max_patches <= 0 else min(max_patches, n)
         rng = np.random.default_rng(seed)
-        indices = rng.choice(n, size=size, replace=False)
-        return features[indices], indices.astype(np.int64)
+        indices = rng.choice(n, size=target_size, replace=False).astype(np.int64)
+        return features[indices], indices
 
     if mode == "coreset":
+        # When a feature cache already contains exactly the requested coreset,
+        # reuse those saved indices instead of recomputing it.
+        if preselected_indices is not None:
+            cached = np.asarray(preselected_indices, dtype=np.int64)
+            if len(cached) == target_size:
+                if cached.min() < 0 or cached.max() >= n:
+                    raise ValueError("Cached coreset indices are out of bounds.")
+                return features[cached], cached
+
         import patchcore.sampler as sampler
 
-        effective = percentage
-        if max_patches > 0:
-            effective = min(effective, max_patches / n)
-        effective = min(max(effective, 1.0 / n), 1.0)
+        effective = target_size / n
         selector = sampler.ApproximateGreedyCoresetSampler(
             percentage=effective,
             device=device,
@@ -318,19 +363,12 @@ def subsample_reference(
         if stored is not None:
             indices = np.asarray(stored, dtype=np.int64)
         else:
-            # Upstream PatchCore does not always expose the selected row indices.
-            # Recover them by matching every selected coreset vector to its exact
-            # nearest row in the original nominal feature matrix. This lets every
-            # dimensionality-reduction method reuse the SAME nominal patches.
             index_finder = NearestNeighbors(
-                n_neighbors=1,
-                metric="euclidean",
-                n_jobs=-1,
+                n_neighbors=1, metric="euclidean", n_jobs=-1,
             )
             index_finder.fit(features)
             recovery_distances, recovered = index_finder.kneighbors(
-                selected,
-                return_distance=True,
+                selected, return_distance=True,
             )
             if not np.allclose(recovery_distances[:, 0], 0.0, atol=1e-6):
                 raise RuntimeError(
@@ -342,6 +380,115 @@ def subsample_reference(
         return selected, indices
 
     raise ValueError(f"Unknown subsampling mode: {mode}")
+
+
+def load_cached_category(cache_root: Path, category: str, args) -> Dict[str, Any]:
+    category_dir = cache_root / category
+    required = [
+        "train_features_full.npy", "coreset_indices.npy", "test_features.npy",
+        "test_image_offsets.npy", "test_metadata.json", "test_masks_uint8.npz",
+        "config.json",
+    ]
+    missing = [name for name in required if not (category_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Incomplete feature cache for {category}: missing {', '.join(missing)} in {category_dir}"
+        )
+
+    all_train = np.asarray(np.load(category_dir / "train_features_full.npy", mmap_mode="r"), dtype=np.float32)
+    cached_coreset_indices = np.asarray(np.load(category_dir / "coreset_indices.npy"), dtype=np.int64)
+    test_features = np.asarray(np.load(category_dir / "test_features.npy", mmap_mode="r"), dtype=np.float32)
+    test_offsets = np.asarray(np.load(category_dir / "test_image_offsets.npy"), dtype=np.int64)
+    masks = np.load(category_dir / "test_masks_uint8.npz")["masks"]
+    metadata = json.loads((category_dir / "test_metadata.json").read_text(encoding="utf-8"))
+    config = json.loads((category_dir / "config.json").read_text(encoding="utf-8"))
+
+    patch_grid = tuple(config.get("train_patch_grid", config.get("test_patch_grid", [])))
+    if len(patch_grid) != 2:
+        raise ValueError(f"Invalid patch grid in {category_dir / 'config.json'}")
+    patch_grid = (int(patch_grid[0]), int(patch_grid[1]))
+    patches_per_image = patch_grid[0] * patch_grid[1]
+
+    if len(all_train) % patches_per_image != 0:
+        raise ValueError(
+            f"Training feature count {len(all_train)} cannot be reshaped into {patch_grid} sequences."
+        )
+    sequences = all_train.reshape(-1, patches_per_image, all_train.shape[1])
+
+    normal_parts: List[np.ndarray] = []
+    defect_parts: MutableMapping[str, List[np.ndarray]] = defaultdict(list)
+    test_sequences: List[np.ndarray] = []
+    test_labels: List[np.ndarray] = []
+    test_types: List[str] = []
+
+    if len(metadata) + 1 != len(test_offsets) or len(metadata) != len(masks):
+        raise ValueError("Cached metadata, offsets, and masks have inconsistent lengths.")
+
+    for i, meta in enumerate(metadata):
+        start, end = int(test_offsets[i]), int(test_offsets[i + 1])
+        image_features = test_features[start:end]
+        if len(image_features) != patches_per_image:
+            raise ValueError(
+                f"Test image {i} has {len(image_features)} patches; expected {patches_per_image}."
+            )
+        mask_tensor = torch.as_tensor(masks[i], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        fractions = F.adaptive_avg_pool2d(mask_tensor, output_size=patch_grid).squeeze().cpu().numpy()
+        labels = (fractions >= args.anomaly_fraction_threshold).reshape(-1)
+        defect_type = str(meta.get("anomaly_type", "good"))
+
+        normal_parts.append(image_features[~labels])
+        if defect_type != "good" and labels.any():
+            defect_parts[defect_type].append(image_features[labels])
+
+        test_sequences.append(image_features)
+        test_labels.append(labels)
+        test_types.append(defect_type)
+
+    rng = np.random.default_rng(args.seed)
+    normal = random_cap(np.concatenate(normal_parts).astype(np.float32), args.max_normal_test_patches, rng)
+    defects = {
+        name: random_cap(np.concatenate(parts).astype(np.float32), args.max_defect_test_patches, rng)
+        for name, parts in sorted(defect_parts.items())
+    }
+    if not defects:
+        raise RuntimeError(f"No defective patches found in cached category {category}.")
+
+    return {
+        "all_train": all_train,
+        "sequences": sequences.astype(np.float16) if "transformer" in parse_methods(args.methods) else None,
+        "patch_grid": patch_grid,
+        "normal": normal,
+        "defects": defects,
+        "cached_coreset_indices": cached_coreset_indices,
+        "cached_test": {
+            "sequences": np.stack(test_sequences).astype(np.float32),
+            "labels": test_labels,
+            "types": test_types,
+        },
+        "cache_config": config,
+    }
+
+
+def collect_transformer_test_cached(model_t, cached_test, mean, std, device, batch_size):
+    sequences = cached_test["sequences"]
+    labels = cached_test["labels"]
+    defect_types = cached_test["types"]
+    normal, defects = [], defaultdict(list)
+    model_t.eval()
+
+    for start in range(0, len(sequences), batch_size):
+        end = min(start + batch_size, len(sequences))
+        batch = ((sequences[start:end] - mean) / std).astype(np.float32)
+        with torch.no_grad():
+            latent = model_t.encode(torch.from_numpy(batch).to(device)).cpu().numpy()
+        for local, global_index in enumerate(range(start, end)):
+            mask = np.asarray(labels[global_index], dtype=bool).reshape(-1)
+            defect_type = defect_types[global_index]
+            normal.append(latent[local][~mask])
+            if defect_type != "good" and mask.any():
+                defects[defect_type].append(latent[local][mask])
+
+    return np.concatenate(normal), {k: np.concatenate(v) for k, v in sorted(defects.items())}
 
 
 def transform_batches(function, values: np.ndarray, batch_size: int) -> np.ndarray:
@@ -793,7 +940,7 @@ def collect_transformer_test(model_pc, model_t, loader, mean, std, device, thres
     return np.concatenate(normal), {k: np.concatenate(v) for k, v in sorted(defects.items())}
 
 
-def run_transformer(sequences, patch_grid, patchcore_model, test_loader, selected_indices, args, directory, device):
+def run_transformer(sequences, patch_grid, patchcore_model, test_loader, selected_indices, args, directory, device, cached_test=None):
     if sequences is None:
         raise RuntimeError("Transformer requires intact training sequences.")
     rng = np.random.default_rng(args.seed)
@@ -864,9 +1011,14 @@ def run_transformer(sequences, patch_grid, patchcore_model, test_loader, selecte
 
     start = time.perf_counter()
     all_train_z = encode_transformer_sequences(model, sequences, mean, std, device, args.transformer_batch_size)
-    normal_z, defects_z = collect_transformer_test(
-        patchcore_model, model, test_loader, mean, std, device, args.anomaly_fraction_threshold
-    )
+    if cached_test is not None:
+        normal_z, defects_z = collect_transformer_test_cached(
+            model, cached_test, mean, std, device, args.transformer_batch_size
+        )
+    else:
+        normal_z, defects_z = collect_transformer_test(
+            patchcore_model, model, test_loader, mean, std, device, args.anomaly_fraction_threshold
+        )
     transform_seconds = time.perf_counter() - start
 
     # The Transformer must train on intact image sequences, but its nominal
@@ -882,7 +1034,250 @@ def run_transformer(sequences, patch_grid, patchcore_model, test_loader, selecte
     return train_z, normal_z, defects_z, fit_seconds, transform_seconds, {"best_validation_loss": float(best_loss)}
 
 
-def run_method(method, sampled_train, selected_indices, normal, defects, sequences, patch_grid, patchcore_model, test_loader, args, directory, device):
+
+def parse_projection_methods(values: Sequence[str]) -> List[str]:
+    tokens: List[str] = []
+    for value in values:
+        tokens.extend(x.strip().lower() for x in value.split(",") if x.strip())
+    if not tokens or "none" in tokens:
+        return []
+    if "all" in tokens:
+        return ["pca", "umap"]
+    valid = {"pca", "umap"}
+    result: List[str] = []
+    for token in tokens:
+        if token not in valid:
+            raise ValueError(
+                f"Unknown projection method '{token}'. Valid: none, all, pca, umap"
+            )
+        if token not in result:
+            result.append(token)
+    return result
+
+
+def save_projection_stage(
+    representation_method: str,
+    train_z: np.ndarray,
+    normal_z: np.ndarray,
+    defects_z: Mapping[str, np.ndarray],
+    directory: Path,
+    args,
+) -> None:
+    """Project an ALREADY reduced representation to 2-D/3-D for visualization.
+
+    Important: this stage is intentionally disabled for ``original`` because the
+    requested workflow is representation reduction first (e.g. 1024->64) and
+    projection second (e.g. 64->2/3). The projector is fitted on nominal
+    reference features only; test normal/defect features are transform-only.
+    """
+    projection_methods = getattr(args, "projection_methods_parsed", [])
+    if not projection_methods:
+        return
+
+    if representation_method == "original":
+        print(
+            "[projection] skipping method=original: projection is only allowed "
+            "after a dimensionality-reduction/representation method."
+        )
+        return
+
+    dims = sorted(set(int(d) for d in args.projection_dims))
+    projection_root = directory / "projections"
+    projection_root.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(args.seed)
+
+    def sample(values: np.ndarray) -> np.ndarray:
+        limit = args.projection_points_per_class
+        if limit <= 0 or len(values) <= limit:
+            return values
+        idx = rng.choice(len(values), limit, replace=False)
+        return values[idx]
+
+    # Fit uses nominal reference only. Sampling here is visualization/projector
+    # fitting control and never introduces test defects into the fit.
+    train_fit = sample(train_z)
+    normal_plot = sample(normal_z)
+    defects_plot = {name: sample(values) for name, values in defects_z.items()}
+
+    for projection_method in projection_methods:
+        for dim in dims:
+            if dim not in (2, 3):
+                raise ValueError("--projection-dims currently supports only 2 and 3")
+            if train_z.shape[1] <= dim:
+                raise ValueError(
+                    f"Cannot project {representation_method} output with dimension "
+                    f"{train_z.shape[1]} to {dim}D; projection input must have more "
+                    "dimensions than its output."
+                )
+
+            out_dir = projection_root / f"{projection_method}_{dim}d"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            if projection_method == "pca":
+                projector = PCA(n_components=dim, random_state=args.seed)
+                train_projected = projector.fit_transform(train_fit)
+                normal_projected = projector.transform(normal_plot)
+                defects_projected = {
+                    name: projector.transform(values)
+                    for name, values in defects_plot.items()
+                }
+                joblib.dump(projector, out_dir / "projector.joblib")
+                projection_extra = {
+                    "explained_variance": float(
+                        projector.explained_variance_ratio_.sum()
+                    )
+                }
+
+            elif projection_method == "umap":
+                try:
+                    import umap
+                except ImportError as exc:
+                    raise ImportError(
+                        "Projection with UMAP requires: pip install umap-learn"
+                    ) from exc
+                projector = umap.UMAP(
+                    n_components=dim,
+                    n_neighbors=args.projection_umap_neighbors,
+                    min_dist=args.projection_umap_min_dist,
+                    metric="euclidean",
+                    random_state=args.seed,
+                )
+                train_projected = projector.fit_transform(train_fit)
+                normal_projected = projector.transform(normal_plot)
+                defects_projected = {
+                    name: projector.transform(values)
+                    for name, values in defects_plot.items()
+                }
+                joblib.dump(projector, out_dir / "projector.joblib")
+                projection_extra = {}
+
+            else:
+                raise ValueError(projection_method)
+
+            # Store projected coordinates so later plotting/analysis never needs
+            # to refit the projection.
+            np.save(out_dir / "nominal_reference_projected.npy", train_projected)
+            np.save(out_dir / "normal_test_projected.npy", normal_projected)
+            np.savez_compressed(
+                out_dir / "defects_projected.npz",
+                **{f"defect__{k}": v for k, v in defects_projected.items()},
+            )
+
+            config = {
+                "representation_method": representation_method,
+                "representation_input_dimension": int(train_z.shape[1]),
+                "projection_method": projection_method,
+                "projection_output_dimension": dim,
+                "fit_on": "nominal_reference_only",
+                "nominal_reference_points_used_for_fit": int(len(train_fit)),
+                "normal_test_points_plotted": int(len(normal_plot)),
+                "projection_points_per_class": int(args.projection_points_per_class),
+                **projection_extra,
+            }
+            (out_dir / "projection_config.json").write_text(
+                json.dumps(config, indent=2)
+            )
+
+            # Static plot.
+            if dim == 2:
+                plt.figure(figsize=(10, 8))
+                plt.scatter(
+                    normal_projected[:, 0], normal_projected[:, 1],
+                    s=9, alpha=0.18, label="normal",
+                )
+                for defect_type, points in sorted(defects_projected.items()):
+                    plt.scatter(
+                        points[:, 0], points[:, 1], s=12, alpha=0.42,
+                        label=defect_type.replace("_", " "),
+                    )
+                plt.xlabel("Projection dimension 1")
+                plt.ylabel("Projection dimension 2")
+                plt.title(
+                    f"{representation_method} {train_z.shape[1]}D -> "
+                    f"{projection_method.upper()} 2D"
+                )
+                plt.grid(alpha=0.15)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(out_dir / "projection_2d.png", dpi=180)
+                plt.close()
+            else:
+                fig = plt.figure(figsize=(11, 9))
+                ax = fig.add_subplot(111, projection="3d")
+                ax.scatter(
+                    normal_projected[:, 0], normal_projected[:, 1],
+                    normal_projected[:, 2], s=9, alpha=0.18, label="normal",
+                )
+                for defect_type, points in sorted(defects_projected.items()):
+                    ax.scatter(
+                        points[:, 0], points[:, 1], points[:, 2],
+                        s=12, alpha=0.42, label=defect_type.replace("_", " "),
+                    )
+                ax.set_xlabel("Projection dimension 1")
+                ax.set_ylabel("Projection dimension 2")
+                ax.set_zlabel("Projection dimension 3")
+                ax.set_title(
+                    f"{representation_method} {train_z.shape[1]}D -> "
+                    f"{projection_method.upper()} 3D"
+                )
+                ax.legend()
+                fig.tight_layout()
+                fig.savefig(out_dir / "projection_3d.png", dpi=180)
+                plt.close(fig)
+
+                if args.projection_html:
+                    try:
+                        import plotly.graph_objects as go
+                    except ImportError:
+                        warnings.warn(
+                            "plotly is not installed; skipping interactive HTML. "
+                            "Install it with: pip install plotly"
+                        )
+                    else:
+                        traces = [
+                            go.Scatter3d(
+                                x=normal_projected[:, 0],
+                                y=normal_projected[:, 1],
+                                z=normal_projected[:, 2],
+                                mode="markers",
+                                name="normal",
+                                marker={"size": 2, "opacity": 0.25},
+                            )
+                        ]
+                        for defect_type, points in sorted(defects_projected.items()):
+                            traces.append(
+                                go.Scatter3d(
+                                    x=points[:, 0], y=points[:, 1], z=points[:, 2],
+                                    mode="markers",
+                                    name=defect_type.replace("_", " "),
+                                    marker={"size": 3, "opacity": 0.55},
+                                )
+                            )
+                        fig_html = go.Figure(data=traces)
+                        fig_html.update_layout(
+                            title=(
+                                f"{representation_method} {train_z.shape[1]}D -> "
+                                f"{projection_method.upper()} 3D"
+                            ),
+                            scene={
+                                "xaxis_title": "Projection dimension 1",
+                                "yaxis_title": "Projection dimension 2",
+                                "zaxis_title": "Projection dimension 3",
+                            },
+                        )
+                        fig_html.write_html(
+                            out_dir / "projection_3d.html",
+                            include_plotlyjs="cdn",
+                        )
+
+            print(
+                f"[projection] {representation_method} {train_z.shape[1]}D -> "
+                f"{projection_method} {dim}D saved in {out_dir}"
+            )
+
+
+def run_method(method, sampled_train, selected_indices, normal, defects, sequences, patch_grid, patchcore_model, test_loader, args, directory, device, cached_test=None):
     print(f"\n{'=' * 72}\nMETHOD: {method}\n{'=' * 72}")
 
     if method == "original":
@@ -946,7 +1341,7 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
     elif method == "transformer":
         train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra = run_transformer(
             sequences, patch_grid, patchcore_model, test_loader,
-            selected_indices, args, directory, device
+            selected_indices, args, directory, device, cached_test=cached_test
         )
     else:
         raise ValueError(method)
@@ -962,6 +1357,12 @@ def run_method(method, sampled_train, selected_indices, normal, defects, sequenc
     save_nearest_neighbor_feature_examples(
         method, train_z, defects_z, directory,
         args.retrieval_examples_per_defect,
+    )
+
+    # Optional second stage: project this ALREADY reduced representation
+    # (for example PCA 64-D) to 2-D/3-D for visualization.
+    save_projection_stage(
+        method, train_z, normal_z, defects_z, directory, args
     )
 
     return evaluate(
@@ -991,12 +1392,20 @@ def make_comparison(results: Sequence[MethodResult]) -> Tuple[pd.DataFrame, pd.D
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="PatchCore dimensionality-reduction pipeline")
-    p.add_argument("--repo-root", type=Path, required=True)
-    p.add_argument("--data-root", type=Path, required=True)
+    p.add_argument("--source", choices=("data", "features"), default="features",
+                   help="data: extract PatchCore features from MVTec images; features: load the saved feature cache")
+    p.add_argument("--repo-root", type=Path, required=True,
+                   help="PatchCore repository root; still needed for coreset sampling and --source data")
+    p.add_argument("--data-root", type=Path, default=None,
+                   help="MVTec root; required only when --source data")
+    p.add_argument("--feature-cache-root", type=Path, default=None,
+                   help="Root containing category feature-cache folders; required when --source features")
     p.add_argument("--output-dir", type=Path, default=Path("dim_reduction_results"))
-    p.add_argument("--category", choices=MVTEC_CATEGORIES, required=True)
+    p.add_argument("--categories", nargs="+", default=["bottle"],
+                   help="One or more categories, comma-separated values, or 'all'")
     p.add_argument("--methods", nargs="+", default=["all"], help="all or method names; comma-separated also works")
-    p.add_argument("--subsampling", choices=("random", "coreset", "none"), default="coreset")
+    p.add_argument("--subsampling", nargs="+", default=["coreset"],
+                   help="One or more of: random coreset none all")
     p.add_argument("--subsample-percentage", type=float, default=0.1)
     p.add_argument("--max-train-patches", type=int, default=30000)
     p.add_argument("--max-normal-test-patches", type=int, default=15000)
@@ -1011,6 +1420,24 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--transform-batch-size", type=int, default=1000)
     p.add_argument("--visualization-points-per-class", type=int, default=2000)
     p.add_argument("--retrieval-examples-per-defect", type=int, default=3)
+
+    # Optional second-stage projection. This is applied only to outputs of
+    # reduced representation methods, never directly to the original 1024-D space.
+    p.add_argument(
+        "--projection-methods", nargs="+", default=["none"],
+        help="Second-stage projection: none, pca, umap, all. Applied after each reduced method.",
+    )
+    p.add_argument(
+        "--projection-dims", nargs="+", type=int, default=[2, 3],
+        help="Projection output dimensions; currently 2 and/or 3.",
+    )
+    p.add_argument("--projection-points-per-class", type=int, default=3000)
+    p.add_argument("--projection-umap-neighbors", type=int, default=30)
+    p.add_argument("--projection-umap-min-dist", type=float, default=0.0)
+    p.add_argument(
+        "--projection-html", action="store_true",
+        help="Also save an interactive Plotly HTML for 3-D projections.",
+    )
 
     p.add_argument("--umap-dim", type=int, default=16)
     p.add_argument("--umap-neighbors", type=int, default=30)
@@ -1043,61 +1470,73 @@ def parser() -> argparse.ArgumentParser:
 
 
 def validate(args) -> None:
+    if args.source == "data" and args.data_root is None:
+        raise ValueError("--data-root is required when --source data")
+    if args.source == "features" and args.feature_cache_root is None:
+        raise ValueError("--feature-cache-root is required when --source features")
     if not 0 < args.subsample_percentage <= 1: raise ValueError("--subsample-percentage must be in (0,1]")
     if not 0 < args.anomaly_fraction_threshold <= 1: raise ValueError("--anomaly-fraction-threshold must be in (0,1]")
     if not 0 < args.nominal_percentile < 100: raise ValueError("--nominal-percentile must be in (0,100)")
     if args.latent_dim <= 0: raise ValueError("--latent-dim must be positive")
+    if any(dim not in (2, 3) for dim in args.projection_dims):
+        raise ValueError("--projection-dims currently accepts only 2 and/or 3")
+    if args.projection_points_per_class == 0:
+        raise ValueError("--projection-points-per-class must be positive or negative for unlimited")
 
 
-def main() -> None:
-    args = parser().parse_args()
-    validate(args)
-    methods = parse_methods(args.methods)
-    device = resolve_device(args.device)
-    set_seed(args.seed)
-
-    repo_root = args.repo_root.resolve(); data_root = args.data_root.resolve()
-    add_repo_src(repo_root)
-    run_dir = args.output_dir.resolve() / args.category / args.subsampling
+def run_one_configuration(
+    args, methods, category, subsampling, device, prepared: Dict[str, Any]
+) -> Path:
+    run_dir = args.output_dir.resolve() / category / subsampling
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    config = vars(args).copy()
-    config.update({"repo_root": str(repo_root), "data_root": str(data_root), "output_dir": str(run_dir), "methods": methods, "device": str(device)})
-    (run_dir / "run_config.json").write_text(json.dumps(config, indent=2, default=str))
-    print(json.dumps(config, indent=2, default=str))
+    all_train = prepared["all_train"]
+    sequences = prepared.get("sequences")
+    patch_grid = prepared["patch_grid"]
+    normal = prepared["normal"]
+    defects = prepared["defects"]
+    cached_indices = prepared.get("cached_coreset_indices") if subsampling == "coreset" else None
 
-    model = build_patchcore_model(device)
-    train_dataset, test_dataset, train_loader, test_loader = build_loaders(
-        data_root, args.category, args.batch_size, args.num_workers, args.seed
-    )
-    print(f"Training images: {len(train_dataset)}")
-    print(f"Testing images: {len(test_dataset)}")
-
-    all_train, sequences, patch_grid = collect_training_embeddings(
-        model, train_loader, keep_sequences="transformer" in methods
-    )
     sampled_train, selected_indices = subsample_reference(
-        all_train, args.subsampling, args.max_train_patches,
+        all_train, subsampling, args.max_train_patches,
         args.subsample_percentage, args.seed, device,
+        preselected_indices=cached_indices,
     )
     np.save(run_dir / "selected_reference_indices.npy", selected_indices)
+
+    config = vars(args).copy()
+    config.update({
+        "repo_root": str(args.repo_root.resolve()),
+        "data_root": str(args.data_root.resolve()) if args.data_root else None,
+        "feature_cache_root": str(args.feature_cache_root.resolve()) if args.feature_cache_root else None,
+        "output_dir": str(run_dir),
+        "category": category,
+        "subsampling_current": subsampling,
+        "methods": methods,
+        "device": str(device),
+        "all_nominal_patch_count": int(len(all_train)),
+        "selected_reference_count": int(len(sampled_train)),
+    })
+    (run_dir / "run_config.json").write_text(json.dumps(config, indent=2, default=str))
+
+    print(f"\n{'#' * 80}")
+    print(f"CATEGORY={category} | SOURCE={args.source} | SUBSAMPLING={subsampling}")
     print(f"All nominal patches: {all_train.shape}")
     print(f"Selected nominal reference: {sampled_train.shape}")
-
-    normal, defects = collect_test_embeddings(
-        model, test_loader, args.anomaly_fraction_threshold,
-        args.max_normal_test_patches, args.max_defect_test_patches, args.seed,
-    )
     print(f"Normal test patches: {normal.shape}")
-    for name, values in defects.items(): print(f"{name}: {values.shape}")
+    for name, values in defects.items():
+        print(f"{name}: {values.shape}")
 
     results: List[MethodResult] = []
     for method in methods:
-        method_dir = run_dir / method; method_dir.mkdir(parents=True, exist_ok=True)
+        method_dir = run_dir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
         try:
             result = run_method(
                 method, sampled_train, selected_indices, normal, defects,
-                sequences, patch_grid, model, test_loader, args, method_dir, device,
+                sequences, patch_grid, prepared.get("patchcore_model"),
+                prepared.get("test_loader"), args, method_dir, device,
+                cached_test=prepared.get("cached_test"),
             )
             save_result(result, method_dir)
             results.append(result)
@@ -1108,17 +1547,120 @@ def main() -> None:
             print(f"[ERROR] {method}: {type(exc).__name__}: {exc}")
 
     if not results:
-        raise RuntimeError("Every selected method failed. Check per-method error.json files.")
+        raise RuntimeError(
+            f"Every selected method failed for {category}/{subsampling}. "
+            "Check per-method error.json files."
+        )
 
     long_table, comparison = make_comparison(results)
     long_table.to_csv(run_dir / "all_method_results_long.csv", index=False)
     save_blending_comparison_plot(long_table, run_dir)
     if len(results) > 1:
         comparison.to_csv(run_dir / "comparison.csv", index=False)
-        print("\nCOMPARISON\n")
-        print(comparison.round(4).to_string(index=False))
 
-    print(f"\nFinished. Outputs: {run_dir}")
+    print(f"Finished: {run_dir}")
+    return run_dir
+
+
+def prepare_category_from_data(args, category, methods, device) -> Dict[str, Any]:
+    data_root = args.data_root.resolve()
+    model = build_patchcore_model(device)
+    train_dataset, test_dataset, train_loader, test_loader = build_loaders(
+        data_root, category, args.batch_size, args.num_workers, args.seed
+    )
+    print(f"Training images: {len(train_dataset)}")
+    print(f"Testing images: {len(test_dataset)}")
+
+    all_train, sequences, patch_grid = collect_training_embeddings(
+        model, train_loader, keep_sequences="transformer" in methods
+    )
+    normal, defects = collect_test_embeddings(
+        model, test_loader, args.anomaly_fraction_threshold,
+        args.max_normal_test_patches, args.max_defect_test_patches, args.seed,
+    )
+    return {
+        "all_train": all_train,
+        "sequences": sequences,
+        "patch_grid": patch_grid,
+        "normal": normal,
+        "defects": defects,
+        "patchcore_model": model,
+        "test_loader": test_loader,
+        "cached_test": None,
+        "cached_coreset_indices": None,
+    }
+
+
+def main() -> None:
+    args = parser().parse_args()
+    validate(args)
+    methods = parse_methods(args.methods)
+    args.projection_methods_parsed = parse_projection_methods(args.projection_methods)
+    categories = parse_categories(args.categories)
+    subsamplings = parse_subsamplings(args.subsampling)
+    device = resolve_device(args.device)
+    set_seed(args.seed)
+
+    args.repo_root = args.repo_root.resolve()
+    add_repo_src(args.repo_root)
+    args.output_dir = args.output_dir.resolve()
+
+    print("Selected configuration:")
+    print(f"  source:       {args.source}")
+    print(f"  categories:   {categories}")
+    print(f"  subsampling:  {subsamplings}")
+    print(f"  methods:      {methods}")
+    print(f"  projections:  {args.projection_methods_parsed or ['none']} -> {args.projection_dims}")
+    print(f"  device:       {device}")
+
+    completed = []
+    failures = []
+
+    for category in categories:
+        try:
+            if args.source == "features":
+                prepared = load_cached_category(args.feature_cache_root.resolve(), category, args)
+            else:
+                prepared = prepare_category_from_data(args, category, methods, device)
+
+            for subsampling in subsamplings:
+                try:
+                    out = run_one_configuration(
+                        args, methods, category, subsampling, device, prepared
+                    )
+                    completed.append(str(out))
+                except Exception as exc:
+                    failures.append({
+                        "category": category, "subsampling": subsampling,
+                        "error_type": type(exc).__name__, "message": str(exc),
+                    })
+                    print(f"[RUN FAILED] {category}/{subsampling}: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            failures.append({
+                "category": category, "subsampling": None,
+                "error_type": type(exc).__name__, "message": str(exc),
+            })
+            print(f"[CATEGORY FAILED] {category}: {type(exc).__name__}: {exc}")
+
+    summary = {
+        "source": args.source,
+        "categories": categories,
+        "subsampling": subsamplings,
+        "methods": methods,
+        "completed": completed,
+        "failures": failures,
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "batch_run_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+
+    print("\n" + "=" * 80)
+    print(f"Completed configurations: {len(completed)}")
+    print(f"Failed configurations:    {len(failures)}")
+    print(f"Summary: {args.output_dir / 'batch_run_summary.json'}")
+    if failures:
+        print("Some configurations failed; see batch_run_summary.json and per-method error.json files.")
 
 
 if __name__ == "__main__":
