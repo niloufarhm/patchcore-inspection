@@ -51,6 +51,12 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+from svdd.patch_feature_svdd import (
+    PatchFeatureSVDDNet,
+    fit_deep_svdd,
+    transform_deep_svdd,
+)
+
 METHODS = (
     "original",
     "pca",
@@ -1336,6 +1342,7 @@ def checkpoint_filename(method: str) -> Optional[str]:
         "autoencoder": "autoencoder.pt",
         "kernel_pca": "kernel_pca.joblib",
         "transformer": "transformer_autoencoder.pt",
+        "deep_svdd": "deep_svdd.pt"
     }.get(method)
 
 
@@ -1650,7 +1657,7 @@ def parse_reduction_chain(values: Optional[Sequence[str]]) -> List[Tuple[str, in
         tokens.extend(x.strip().lower() for x in value.split(",") if x.strip())
 
     stages: List[Tuple[str, int]] = []
-    valid = {"pca", "umap", "autoencoder", "kernel_pca", "transformer"}
+    valid = {"pca", "umap", "autoencoder", "kernel_pca", "transformer", "deep_svdd"}
     for token in tokens:
         if ":" not in token:
             raise ValueError(
@@ -1712,6 +1719,13 @@ def _checkpoint_dims_ok(method: str, checkpoint: Path, input_dim: int, output_di
             in_dim = int(ckpt.get("input_dim", input_dim))
             out_dim = int(ckpt.get("latent_dim", output_dim))
             return in_dim == input_dim and out_dim == output_dim
+
+        if method == "deep_svdd":
+            ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            in_dim = int(ckpt["input_dim"])
+            out_dim = int(ckpt["output_dim"])
+            return in_dim == input_dim and out_dim == output_dim
+          
     except Exception as exc:
         print(f"[chain checkpoint] could not validate {checkpoint}: {type(exc).__name__}: {exc}")
         return False
@@ -1894,6 +1908,23 @@ def apply_chain_stage(
             )
             extra.update(loaded_extra)
 
+
+        elif method == "deep_svdd":
+
+            ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+            net = PatchFeatureSVDDNet(input_dim=int(ckpt["input_dim"]), rep_dim=int(ckpt["output_dim"]),).to(device)
+            net.load_state_dict(ckpt["state_dict"])
+            net.eval()
+        
+            c = ckpt["center"].to(device)
+            start = time.perf_counter()
+            train_z = transform_deep_svdd(net, train, device,)
+            normal_z = transform_deep_svdd(net, normal, device)
+            defects_z = {name: transform_deep_svdd(net, values, device) for name, values in defects.items() }
+            transform_seconds = time.perf_counter() - start
+        
+            extra["svdd_center_norm"] = float(torch.linalg.vector_norm(c).item())
+
         else:
             raise ValueError(method)
 
@@ -1984,6 +2015,42 @@ def apply_chain_stage(
                 )
             )
             extra.update(tr_extra)
+
+
+        elif method == "deep_svdd":
+        
+            start = time.perf_counter()
+        
+            net, c = fit_deep_svdd(train,
+                output_dim=output_dim,
+                device=device,
+                epochs=args.deep_svdd_epochs,
+                lr=args.deep_svdd_lr,
+                batch_size=args.deep_svdd_batch_size,
+                weight_decay=args.deep_svdd_weight_decay,
+            )
+        
+            fit_seconds = time.perf_counter() - start
+        
+            start = time.perf_counter()
+          
+            train_z = transform_deep_svdd(net, train, device)
+            normal_z = transform_deep_svdd(net, normal, device)
+            defects_z = {
+                name: transform_deep_svdd(net, values,device)
+                for name, values in defects.items()
+            }
+            transform_seconds = time.perf_counter() - start
+            torch.save(
+                {
+                    "state_dict": net.state_dict(),
+                    "center": c.detach().cpu(),
+                    "input_dim": int(train.shape[1]),
+                    "output_dim": int(output_dim),
+                },
+                stage_dir / "deep_svdd.pt",
+            )
+            extra["svdd_center_norm"] = float(torch.linalg.vector_norm(c).item())
 
         else:
             raise ValueError(method)
@@ -2350,6 +2417,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--transformer-encoder-layers", type=int, default=4)
     p.add_argument("--transformer-decoder-layers", type=int, default=4)
     p.add_argument("--transformer-dropout", type=float, default=0.1)
+
+    P.add_argument("--deep-svdd-epochs", type=int, default=150)
+    P.add_argument( "--deep-svdd-lr", type=float, default=1e-4)
+    P.add_argument("--deep-svdd-batch-size", type=int, default=256)
+    P.add_argument("--deep-svdd-weight-decay", type=float, default=5e-7)
+    
     return p
 
 
