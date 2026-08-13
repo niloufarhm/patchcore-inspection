@@ -2093,7 +2093,136 @@ def apply_chain_stage(
 
     return train_z, normal_z, defects_z, fit_seconds, transform_seconds, extra
 
+def save_patch_position_plot(
+    train_z: Optional[np.ndarray], selected_indices: Optional[np.ndarray],
+    patch_grid: Tuple[int, int], directory: Path, title: str,
+    max_points: int = 20000, seed: int = 42, run_dir: Optional[Path] = None,
+):
+    """Create interactive nominal patch-position plots."""
 
+    try:
+        import plotly.express as px
+    except ImportError:
+        warnings.warn("Plotly is not installed; skipping patch-position plot.")
+        return
+
+    directory = Path(directory)
+    nominal_file = directory / "nominal_reference.npy"
+
+    if nominal_file.exists():
+        print(f"[patch plot] reusing saved nominal representation: {nominal_file}")
+        train_z = np.asarray(np.load(nominal_file, mmap_mode="r"), dtype=np.float32)
+    elif train_z is None:
+        raise FileNotFoundError(f"No nominal_reference.npy in {directory} and no train_z provided.")
+    else:
+        train_z = np.asarray(train_z, dtype=np.float32)
+
+    selected_file = Path(run_dir) / "selected_reference_indices.npy" if run_dir is not None else None
+    if selected_file is not None and selected_file.exists():
+        print(f"[patch plot] reusing selected patch indices: {selected_file}")
+        selected_indices = np.asarray(np.load(selected_file), dtype=np.int64)
+    elif selected_indices is None:
+        raise FileNotFoundError("No selected_reference_indices.npy found and no selected_indices provided.")
+    else:
+        selected_indices = np.asarray(selected_indices, dtype=np.int64)
+
+    if len(train_z) != len(selected_indices):
+        raise ValueError(
+            f"Patch plot mismatch: {len(train_z)} representation vectors vs "
+            f"{len(selected_indices)} patch indices."
+        )
+
+    patch_dir = directory / "patch_plots"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+
+    h, w = patch_grid
+    patches_per_image = h * w
+    patch_id = selected_indices % patches_per_image
+    image_id = selected_indices // patches_per_image
+    row, column = patch_id // w, patch_id % w
+
+    rng = np.random.default_rng(seed)
+    if max_points > 0 and len(train_z) > max_points:
+        keep = rng.choice(len(train_z), size=max_points, replace=False)
+        train_plot = train_z[keep]
+        patch_id, row, column, image_id = patch_id[keep], row[keep], column[keep], image_id[keep]
+    else:
+        train_plot = train_z
+
+    original_dim = train_plot.shape[1]
+    if original_dim == 2:
+        coords, plot_dim = train_plot, 2
+        visualization = "existing 2D representation"
+    elif original_dim == 3:
+        coords, plot_dim = train_plot, 3
+        visualization = "existing 3D representation"
+    else:
+        try:
+            import umap
+        except ImportError:
+            warnings.warn("umap-learn is not installed; cannot visualize representation >3D.")
+            return
+
+        print(f"[patch plot] visualization only: {original_dim}D -> UMAP2")
+        reducer = umap.UMAP(
+            n_components=2, n_neighbors=30, min_dist=0.0,
+            metric="euclidean", random_state=seed
+        )
+        coords = reducer.fit_transform(train_plot)
+        joblib.dump(reducer, patch_dir / "patch_plot_umap2.joblib")
+        plot_dim = 2
+        visualization = f"UMAP2 visualization of {original_dim}D representation"
+
+    data = {
+        "dim1": coords[:, 0], "dim2": coords[:, 1],
+        "patch_id": patch_id.astype(int), "row": row.astype(int),
+        "column": column.astype(int), "source_image": image_id.astype(int),
+    }
+    if plot_dim == 3:
+        data["dim3"] = coords[:, 2]
+
+    df = pd.DataFrame(data)
+    colorings = {
+        "patch_id": "Patch ID",
+        "row": "Patch row",
+        "column": "Patch column",
+        "source_image": "Source image ID",
+    }
+
+    for color_key, label in colorings.items():
+        common = dict(
+            data_frame=df, color=color_key,
+            hover_data=["patch_id", "row", "column", "source_image"],
+            title=f"{title}<br>{visualization} — colored by {label}",
+            opacity=0.55,
+        )
+
+        if plot_dim == 3:
+            fig = px.scatter_3d(x="dim1", y="dim2", z="dim3", **common)
+        else:
+            fig = px.scatter(x="dim1", y="dim2", **common)
+
+        fig.update_traces(marker={"size": 3})
+        fig.write_html(patch_dir / f"{color_key}.html", include_plotlyjs="cdn")
+
+    config = {
+        "title": title,
+        "patch_grid": [int(h), int(w)],
+        "patches_per_image": int(patches_per_image),
+        "representation_dimension": int(original_dim),
+        "plot_dimension": int(plot_dim),
+        "visualization": visualization,
+        "total_nominal_points": int(len(train_z)),
+        "points_plotted": int(len(coords)),
+        "seed": int(seed),
+    }
+
+    (patch_dir / "patch_plot_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
+
+    print(f"[patch plot] saved -> {patch_dir}")
+  
 def save_chain_lowdim_plot(
     chain_label: str,
     train: np.ndarray,
@@ -2189,7 +2318,211 @@ def save_chain_lowdim_plot(
             )
             fig_html.write_html(directory / "chain_3d.html", include_plotlyjs="cdn")
 
+    h, w = patch_grid
+    patches_per_image = h * w
 
+    selected_indices = np.asarray(selected_indices, dtype=np.int64)
+
+    if len(selected_indices) != len(train_z):
+        raise ValueError(
+            "Patch-position plot requires one original selected index "
+            "for every nominal representation vector. "
+            f"Got {len(selected_indices)} indices and {len(train_z)} vectors."
+        )
+
+    patch_id = selected_indices % patches_per_image
+    image_id = selected_indices // patches_per_image
+
+    row = patch_id // w
+    col = patch_id % w
+
+    # Optional cap for browser performance
+    rng = np.random.default_rng(seed)
+
+    if max_points > 0 and len(train_z) > max_points:
+        keep = rng.choice(
+            len(train_z),
+            size=max_points,
+            replace=False,
+        )
+
+        z = train_z[keep]
+        patch_id = patch_id[keep]
+        image_id = image_id[keep]
+        row = row[keep]
+        col = col[keep]
+    else:
+        z = train_z
+
+    data = {
+        "x": z[:, 0],
+        "y": z[:, 1],
+        "patch_id": patch_id.astype(int),
+        "row": row.astype(int),
+        "column": col.astype(int),
+        "image_id": image_id.astype(int),
+    }
+
+    if z.shape[1] == 3:
+        data["z"] = z[:, 2]
+
+    df = pd.DataFrame(data)
+
+    if z.shape[1] == 2:
+        fig = px.scatter(
+            df,
+            x="x",
+            y="y",
+            color="patch_id",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by patch ID",
+            opacity=0.55,
+        )
+    else:
+        fig = px.scatter_3d(
+            df,
+            x="x",
+            y="y",
+            z="z",
+            color="patch_id",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by patch ID",
+            opacity=0.55,
+        )
+
+    fig.update_traces(marker={"size": 3})
+
+    fig.write_html(
+        directory / "patch_position_id.html",
+        include_plotlyjs="cdn",
+    )
+
+    if z.shape[1] == 2:
+        fig = px.scatter(
+            df,
+            x="x",
+            y="y",
+            color="row",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by row",
+            opacity=0.55,
+        )
+    else:
+        fig = px.scatter_3d(
+            df,
+            x="x",
+            y="y",
+            z="z",
+            color="row",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by row",
+            opacity=0.55,
+        )
+
+    fig.update_traces(marker={"size": 3})
+
+    fig.write_html(
+        directory / "patch_position_row.html",
+        include_plotlyjs="cdn",
+    )
+    if z.shape[1] == 2:
+        fig = px.scatter(
+            df,
+            x="x",
+            y="y",
+            color="column",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by column",
+            opacity=0.55,
+        )
+    else:
+        fig = px.scatter_3d(
+            df,
+            x="x",
+            y="y",
+            z="z",
+            color="column",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by column",
+            opacity=0.55,
+        )
+
+    fig.update_traces(marker={"size": 3})
+
+    fig.write_html(
+        directory / "patch_position_column.html",
+        include_plotlyjs="cdn",
+    )
+    if z.shape[1] == 2:
+        fig = px.scatter(
+            df,
+            x="x",
+            y="y",
+            color="image_id",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by source image",
+            opacity=0.55,
+        )
+    else:
+        fig = px.scatter_3d(
+            df,
+            x="x",
+            y="y",
+            z="z",
+            color="image_id",
+            hover_data=[
+                "patch_id",
+                "row",
+                "column",
+                "image_id",
+            ],
+            title=f"{title} — nominal patches colored by source image",
+            opacity=0.55,
+        )
+
+    fig.update_traces(marker={"size": 3})
+
+    fig.write_html(
+        directory / "patch_source_image.html",
+        include_plotlyjs="cdn",
+    )
+
+    print(f"[patch plot] saved patch-position plots in {directory}")
 def run_reduction_chain(
     args,
     stages: Sequence[Tuple[str, int]],
@@ -2287,6 +2620,18 @@ def run_reduction_chain(
             save_chain_lowdim_plot(
                 prefix, train_current, normal_current, defects_current,
                 stage_dir, args,
+            )
+        if args.patch_plot and stage_index == len(stages) - 1:
+
+            save_patch_position_plot(
+                train_z=train_current,
+                selected_indices=selected_indices,
+                patch_grid=prepared["patch_grid"],
+                directory=stage_dir,
+                title=slug,
+                max_points=args.patch_plot_max_points,
+                seed=args.seed,
+                run_dir=run_dir,
             )
 
     # Always evaluate the final representation.
@@ -2422,6 +2767,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument( "--deep-svdd-lr", type=float, default=1e-4)
     p.add_argument("--deep-svdd-batch-size", type=int, default=256)
     p.add_argument("--deep-svdd-weight-decay", type=float, default=5e-7)
+
+    p.add_argument("--patch-plot", action="store_true",help="plot for patch spatial position.")
     
     return p
 
